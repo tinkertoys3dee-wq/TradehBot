@@ -1,0 +1,5 @@
+alpaca-py>=0.40.0
+pandas
+numpy
+scikit-learn
+joblib
