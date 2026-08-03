@@ -1,1 +1,2445 @@
+"""
+================================================================================
+ALPACA ML INTRADAY TRADING BOT (PAPER TRADING ONLY)
+================================================================================
 
+A self-contained, single-file algorithmic trading system that:
+
+  1. Pulls historical + streaming-ish (polled) bar data from Alpaca
+  2. Engineers a technical-indicator feature set
+  3. Trains / periodically retrains a soft-voting ML ensemble (gradient
+     boosting + random forest + logistic regression) that predicts the
+     probability of an up-move over the next N bars
+  4. Combines the ML signal with a rule-based intraday trend filter AND a
+     higher-timeframe (daily) trend confirmation, so intraday calls aren't
+     fighting the primary trend
+  5. Sizes positions with a volatility-adjusted (ATR-based) risk model,
+     with correlation-aware caps so it won't stack SPY+QQQ-style
+     correlated bets as if they were independent
+  6. Places bracket orders (entry + stop-loss + take-profit) on Alpaca's
+     PAPER trading endpoint
+  7. Tracks equity, enforces a daily max-loss kill switch (persisted to
+     disk so a crash/restart mid-day doesn't reset the baseline), records
+     realized fills, and logs every decision and trade to disk
+  8. Can run an offline backtest (--backtest) against historical data with
+     a simple spread/slippage cost model, or print a performance report
+     (--report) with Sharpe ratio, max drawdown, win rate, and profit
+     factor from your accumulated logs
+  9. Ratchets stop-losses tighter as a winning position runs (optional,
+     config.trailing_stop), scales position size up/down based on recent
+     realized performance rather than sizing every trade identically, and
+     retries transient API errors with exponential backoff so a single
+     dropped connection doesn't crash an hours-long session
+ 10. Skips trading when volatility is in an extreme regime (ATR percentile
+     too low = cost eats the edge, too high = gap/slippage risk), scales
+     out of winning positions in two lots (a closer target + the full
+     target) instead of all-or-nothing exits, writes a heartbeat file for
+     external monitoring, and supports a JSON config file (--config) plus
+     --dump-config for generating one
+
+--------------------------------------------------------------------------------
+SAFETY / DISCLAIMER
+--------------------------------------------------------------------------------
+- This script is HARD-CODED to refuse to run against a live trading account.
+  It verifies `ALPACA_BASE_URL` / the `paper` flag before doing anything and
+  raises if it detects a live endpoint.
+- This is NOT financial advice and is not guaranteed to be profitable. Paper
+  trading results do not guarantee live results (no slippage/latency/queue
+  position modeling beyond what Alpaca's paper engine simulates).
+- You are responsible for testing thoroughly and understanding the code
+  before ever pointing it at a funded account.
+
+--------------------------------------------------------------------------------
+SETUP
+--------------------------------------------------------------------------------
+1. pip install alpaca-py pandas numpy scikit-learn joblib
+
+2. Create a free Alpaca account -> generate PAPER API keys, then set:
+
+     export APCA_API_KEY_ID="your_paper_key_id"
+     export APCA_API_SECRET_KEY="your_paper_secret_key"
+
+   (On Windows/PowerShell: $env:APCA_API_KEY_ID="...")
+
+3. Run in PyCharm (or terminal):
+
+     python alpaca_ml_trading_bot.py --symbols AAPL MSFT SPY QQQ NVDA --dry-run
+
+   Other modes:
+     python alpaca_ml_trading_bot.py --backtest --symbols AAPL MSFT SPY
+         Runs an offline historical backtest, no orders ever submitted.
+     python alpaca_ml_trading_bot.py --report
+         Prints Sharpe/drawdown/win-rate/profit-factor from existing logs.
+
+4. To stop the bot cleanly at any time, either Ctrl+C or create a file named
+   `STOP_TRADING` in the working directory -- the bot polls for it and will
+   flatten/halt gracefully.
+
+--------------------------------------------------------------------------------
+ARCHITECTURE
+--------------------------------------------------------------------------------
+TradingConfig       -- all tunable parameters in one place
+AlpacaDataFeed       -- historical bar + quote + clock + daily-trend access
+FeatureEngineer      -- turns raw OHLCV into a model-ready feature frame
+MLSignalModel        -- trains/retrains/predicts with a soft-voting ensemble
+SignalGenerator      -- ML + intraday trend + daily trend confirmation
+RiskManager          -- sizing, stop/take, persisted daily loss halt,
+                        correlation-group exposure caps
+OrderExecutor        -- submits/cancels orders, bracket orders, stop replaces
+TrailingStopManager  -- ratchets stop-losses tighter as a position runs
+TradeJournal         -- CSV + log-file record of bot decisions
+FillTracker          -- records actual Alpaca fills for realized P&L
+PerformanceAnalyzer  -- Sharpe, drawdown, win rate, profit factor
+Backtester           -- offline historical simulation with cost modeling
+TradingBot           -- orchestrates everything through the trading day
+================================================================================
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import re
+import sys
+import time
+import traceback
+import warnings
+from dataclasses import dataclass, field, asdict, fields
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Optional, Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+
+# --------------------------------------------------------------------------
+# Third-party ML deps
+# --------------------------------------------------------------------------
+try:
+    from sklearn.ensemble import (
+        GradientBoostingClassifier,
+        RandomForestClassifier,
+        VotingClassifier,
+    )
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.model_selection import TimeSeriesSplit
+    from sklearn.metrics import accuracy_score, precision_score, roc_auc_score
+    import joblib
+except ImportError as exc:  # pragma: no cover
+    raise SystemExit(
+        "Missing ML dependencies. Run:\n"
+        "    pip install scikit-learn joblib\n"
+        f"Original error: {exc}"
+    )
+
+# --------------------------------------------------------------------------
+# Alpaca SDK (alpaca-py)
+# --------------------------------------------------------------------------
+try:
+    from alpaca.trading.client import TradingClient
+    from alpaca.trading.requests import (
+        MarketOrderRequest,
+        LimitOrderRequest,
+        StopLossRequest,
+        TakeProfitRequest,
+        GetOrdersRequest,
+        ClosePositionRequest,
+        ReplaceOrderRequest,
+    )
+    from alpaca.trading.enums import (
+        OrderSide,
+        TimeInForce,
+        OrderClass,
+        QueryOrderStatus,
+    )
+    from alpaca.data.historical import StockHistoricalDataClient
+    from alpaca.data.historical.news import NewsClient
+    from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest, NewsRequest
+    from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+except ImportError as exc:  # pragma: no cover
+    raise SystemExit(
+        "Missing Alpaca SDK. Run:\n"
+        "    pip install alpaca-py\n"
+        f"Original error: {exc}"
+    )
+
+
+# ==============================================================================
+# 1. CONFIGURATION
+# ==============================================================================
+
+@dataclass
+class TradingConfig:
+    """All tunable knobs for the bot live here so nothing is buried in logic."""
+
+    # --- Credentials -----------------------------------------------------
+    api_key: str = field(default_factory=lambda: os.environ.get("APCA_API_KEY_ID", ""))
+    secret_key: str = field(default_factory=lambda: os.environ.get("APCA_API_SECRET_KEY", ""))
+    paper: bool = True  # NEVER set False in this script. See TradingBot._safety_check.
+
+    # --- Universe & bar settings ------------------------------------------
+    symbols: List[str] = field(default_factory=lambda: ["AAPL", "MSFT", "SPY", "QQQ", "NVDA"])
+    timeframe_amount: int = 15
+    timeframe_unit: str = "Minute"       # "Minute", "Hour", "Day"
+    lookback_days: int = 120              # history pulled for training/features
+    min_bars_required: int = 250         # minimum bars before we'll train/trade a symbol
+
+    # --- Model / retraining -------------------------------------------------
+    prediction_horizon_bars: int = 8     # predict direction N bars ahead
+    retrain_interval_minutes: int = 120  # how often to refit the model
+    min_train_accuracy: float = 0.50     # sanity floor; below this we stay flat
+    min_prediction_confidence: float = 0.58  # min predicted P(up) / P(down) to act
+
+    # --- Risk management -----------------------------------------------------
+    risk_per_trade_pct: float = 0.01     # fraction of equity risked per trade
+    max_positions: int = 5
+    max_position_pct_of_equity: float = 0.25  # cap notional per symbol
+    max_daily_loss_pct: float = 0.03     # halt all new trades after this drawdown
+    stop_loss_atr_mult: float = 2.0
+    take_profit_atr_mult: float = 3.0
+    trailing_stop: bool = False
+
+    # --- Multi-timeframe trend confirmation --------------------------------
+    require_daily_trend_confirmation: bool = True
+    daily_trend_sma_period: int = 50
+    daily_trend_refresh_minutes: int = 60   # how often to re-check the daily trend
+
+    # --- Correlation-aware exposure limits ----------------------------------
+    correlation_groups: Dict[str, List[str]] = field(
+        default_factory=lambda: {
+            "broad_market": ["SPY", "QQQ", "DIA", "IWM"],
+            "mega_cap_tech": ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META"],
+        }
+    )
+    max_positions_per_correlation_group: int = 2
+
+    # --- Backtesting cost model (basis points, round-trip) -------------------
+    backtest_spread_bps: float = 5.0
+    backtest_slippage_bps: float = 2.0
+    backtest_test_fraction: float = 0.3   # fraction of history held out as the walk-forward test window
+
+    # --- Adaptive, performance-based position sizing -------------------------
+    adaptive_sizing_enabled: bool = True
+    adaptive_sizing_lookback_trades: int = 20
+    adaptive_sizing_min_multiplier: float = 0.5   # size down to half after a bad stretch
+    adaptive_sizing_max_multiplier: float = 1.5   # size up to 1.5x after a strong stretch
+    adaptive_sizing_refresh_minutes: int = 30     # how often to recompute the multiplier
+
+    # --- Volatility regime filter ---------------------------------------------
+    volatility_regime_filter_enabled: bool = True
+    atr_percentile_window: int = 100     # trailing bars used to rank current ATR
+    atr_percentile_min: float = 0.05     # skip trading below this percentile (too quiet: cost eats edge)
+    atr_percentile_max: float = 0.95     # skip trading above this percentile (too chaotic: gap/slippage risk)
+
+    # --- Partial profit taking (scale-out) ------------------------------------
+    enable_partial_scale_out: bool = True
+    scale_out_first_target_atr_mult: float = 1.5   # closer target for the first lot
+    scale_out_fraction: float = 0.5                # fraction of qty exited at the first target
+
+    # --- News sentiment overlay (live-only; NOT reflected in --backtest, since
+    # backfilling historical news across an entire training window is out of
+    # scope -- see NewsSentimentAnalyzer docstring) --------------------------
+    news_sentiment_enabled: bool = True
+    news_lookback_hours: int = 24
+    news_sentiment_refresh_minutes: int = 30
+    news_sentiment_block_threshold: float = -0.3        # block new BUYs if sentiment <= this
+    news_sentiment_short_block_threshold: float = 0.3   # block new SELLs if sentiment >= this
+
+    # --- Loop timing -----------------------------------------------------------
+    poll_interval_seconds: int = 60
+    entry_cutoff_minutes_before_close: int = 20  # stop opening new positions late in day
+    flatten_before_close_minutes: int = 5        # close all positions before the bell
+
+    # --- Bookkeeping --------------------------------------------------------
+    model_dir: str = "models"
+    log_dir: str = "logs"
+    trade_log_csv: str = "trade_log.csv"
+    equity_curve_csv: str = "equity_curve.csv"
+    fills_csv: str = "fills.csv"
+    kill_switch_file: str = "STOP_TRADING"
+    state_dir: str = "state"
+    daily_state_file: str = "daily_state.json"
+    heartbeat_file: str = "heartbeat.json"
+
+    dry_run: bool = False  # if True, computes signals/orders but never submits them
+
+    def timeframe(self) -> TimeFrame:
+        unit_map = {
+            "Minute": TimeFrameUnit.Minute,
+            "Hour": TimeFrameUnit.Hour,
+            "Day": TimeFrameUnit.Day,
+        }
+        return TimeFrame(self.timeframe_amount, unit_map[self.timeframe_unit])
+
+
+# ==============================================================================
+# 2. LOGGING
+# ==============================================================================
+
+def build_logger(log_dir: str) -> logging.Logger:
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("alpaca_ml_bot")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+
+    fmt = logging.Formatter(
+        "%(asctime)s | %(levelname)-7s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    )
+
+    console = logging.StreamHandler(sys.stdout)
+    console.setFormatter(fmt)
+    logger.addHandler(console)
+
+    file_handler = logging.FileHandler(
+        Path(log_dir) / f"bot_{datetime.now().strftime('%Y%m%d')}.log"
+    )
+    file_handler.setFormatter(fmt)
+    logger.addHandler(file_handler)
+
+    return logger
+
+
+# ==============================================================================
+# 2.5 RETRY / RESILIENCE UTILITY
+# ==============================================================================
+
+def call_with_retry(
+    fn,
+    *args,
+    max_attempts: int = 3,
+    base_delay: float = 1.0,
+    logger: Optional[logging.Logger] = None,
+    **kwargs,
+):
+    """
+    Calls `fn(*args, **kwargs)`, retrying on any exception with exponential
+    backoff (base_delay, base_delay*2, base_delay*4, ...). Re-raises the
+    final exception if every attempt fails. This absorbs the transient
+    network blips, rate-limit responses, and momentary API hiccups that a
+    bot polling every 60 seconds for hours on end will eventually hit --
+    without this, a single dropped connection would crash the whole loop
+    or silently skip a cycle.
+    """
+    last_exc: Optional[Exception] = None
+    fn_name = getattr(fn, "__name__", str(fn))
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            last_exc = exc
+            if attempt == max_attempts:
+                break
+            delay = base_delay * (2 ** (attempt - 1))
+            if logger:
+                logger.warning(
+                    f"Transient error on attempt {attempt}/{max_attempts} calling "
+                    f"{fn_name}: {exc}. Retrying in {delay:.1f}s..."
+                )
+            time.sleep(delay)
+    raise last_exc
+
+
+# ==============================================================================
+# 3. DATA FEED
+# ==============================================================================
+
+class AlpacaDataFeed:
+    """Thin wrapper around alpaca-py's historical data + trading clock."""
+
+    def __init__(self, config: TradingConfig, trading_client: TradingClient, logger: logging.Logger):
+        self.config = config
+        self.trading_client = trading_client
+        self.logger = logger
+        self.data_client = StockHistoricalDataClient(config.api_key, config.secret_key)
+        self.news_client = NewsClient(config.api_key, config.secret_key)
+
+    def get_clock(self):
+        return call_with_retry(self.trading_client.get_clock, logger=self.logger)
+
+    def is_market_open(self) -> bool:
+        try:
+            return bool(self.get_clock().is_open)
+        except Exception as exc:
+            self.logger.error(f"Failed to fetch market clock: {exc}")
+            return False
+
+    def minutes_to_close(self) -> Optional[float]:
+        try:
+            clock = self.get_clock()
+            if not clock.is_open:
+                return None
+            delta = clock.next_close - clock.timestamp
+            return delta.total_seconds() / 60.0
+        except Exception as exc:
+            self.logger.error(f"Failed to compute minutes to close: {exc}")
+            return None
+
+    def fetch_bars(self, symbol: str) -> pd.DataFrame:
+        """Pull `lookback_days` of bars for `symbol` and return a clean DataFrame."""
+        start = datetime.now(timezone.utc) - timedelta(days=self.config.lookback_days)
+        request = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=self.config.timeframe(),
+            start=start,
+        )
+        try:
+            bars = call_with_retry(
+                self.data_client.get_stock_bars, request, logger=self.logger
+            )
+        except Exception as exc:
+            self.logger.error(f"[{symbol}] bar fetch failed after retries: {exc}")
+            return pd.DataFrame()
+
+        df = bars.df
+        if df.empty:
+            return df
+
+        # Multi-index (symbol, timestamp) -> flatten to just timestamp for one symbol
+        if isinstance(df.index, pd.MultiIndex):
+            df = df.xs(symbol, level=0)
+
+        df = df.sort_index()
+        df = df.rename(
+            columns={
+                "open": "open",
+                "high": "high",
+                "low": "low",
+                "close": "close",
+                "volume": "volume",
+            }
+        )
+        return df[["open", "high", "low", "close", "volume"]].dropna()
+
+    def latest_quote_midprice(self, symbol: str) -> Optional[float]:
+        try:
+            req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
+            quote = self.data_client.get_stock_latest_quote(req)[symbol]
+            bid, ask = quote.bid_price, quote.ask_price
+            if bid and ask and bid > 0 and ask > 0:
+                return (bid + ask) / 2.0
+            return ask or bid or None
+        except Exception as exc:
+            self.logger.warning(f"[{symbol}] latest quote fetch failed: {exc}")
+            return None
+
+    def fetch_daily_trend(self, symbol: str, sma_period: int) -> Optional[str]:
+        """
+        Pulls daily bars and returns 'UP' if the latest close is above its
+        `sma_period`-day SMA, 'DOWN' if below, or None if there isn't enough
+        history yet. Used as a higher-timeframe filter so the intraday model
+        isn't fighting the primary trend.
+        """
+        start = datetime.now(timezone.utc) - timedelta(days=int(sma_period * 2.5) + 10)
+        request = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=TimeFrame(1, TimeFrameUnit.Day),
+            start=start,
+        )
+        try:
+            bars = self.data_client.get_stock_bars(request)
+        except Exception as exc:
+            self.logger.warning(f"[{symbol}] daily trend fetch failed: {exc}")
+            return None
+
+        df = bars.df
+        if df.empty:
+            return None
+        if isinstance(df.index, pd.MultiIndex):
+            df = df.xs(symbol, level=0)
+        df = df.sort_index()
+
+        if len(df) < sma_period:
+            return None
+
+        sma = df["close"].rolling(sma_period).mean().iloc[-1]
+        last_close = df["close"].iloc[-1]
+        if pd.isna(sma):
+            return None
+        return "UP" if last_close >= sma else "DOWN"
+
+    def fetch_recent_news(self, symbol: str, lookback_hours: int, limit: int = 30) -> List[Dict]:
+        """
+        Pulls recent news headlines/summaries for `symbol` via Alpaca's News
+        API (Benzinga-sourced, included with your existing Market Data API
+        keys -- no separate signup or API key needed). Returns a list of
+        plain dicts ({'headline', 'summary', 'created_at'}) so callers don't
+        need to know about alpaca-py's internal News response models.
+        Returns an empty list (never raises) on any failure, so a news
+        outage degrades to "no sentiment signal" rather than crashing the bot.
+        """
+        start = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+        request = NewsRequest(symbols=symbol, start=start, limit=limit)
+        try:
+            news = call_with_retry(self.news_client.get_news, request, logger=self.logger)
+        except Exception as exc:
+            self.logger.warning(f"[{symbol}] news fetch failed: {exc}")
+            return []
+
+        try:
+            df = news.df
+        except Exception as exc:
+            self.logger.warning(f"[{symbol}] failed to parse news response: {exc}")
+            return []
+
+        if df is None or df.empty:
+            return []
+
+        articles = []
+        for _, row in df.iterrows():
+            created_at = row.get("created_at") if hasattr(row, "get") else None
+            if created_at is not None and not isinstance(created_at, datetime):
+                try:
+                    created_at = pd.Timestamp(created_at).to_pydatetime()
+                except Exception:
+                    created_at = None
+            articles.append({
+                "headline": str(row.get("headline", "") or ""),
+                "summary": str(row.get("summary", "") or ""),
+                "created_at": created_at,
+            })
+        return articles
+
+
+# ==============================================================================
+# 4. FEATURE ENGINEERING
+# ==============================================================================
+
+class FeatureEngineer:
+    """
+    Converts raw OHLCV bars into a feature matrix of hand-crafted technical
+    indicators. All indicators are computed with plain pandas/numpy so the
+    script has no dependency beyond the ML stack.
+    """
+
+    FEATURE_COLUMNS: List[str] = [
+        "return_1", "return_3", "return_5", "return_10",
+        "log_vol_change",
+        "sma_5_ratio", "sma_10_ratio", "sma_20_ratio",
+        "ema_12_ratio", "ema_26_ratio",
+        "macd", "macd_signal", "macd_hist",
+        "rsi_14",
+        "bb_pctb", "bb_width",
+        "atr_14_pct",
+        "stoch_k", "stoch_d",
+        "volume_zscore",
+        "high_low_range_pct",
+        "close_position_in_range",
+        "momentum_10",
+        "volatility_10",
+        "atr_percentile",
+    ]
+
+    def __init__(self, atr_percentile_window: int = 100):
+        self.atr_percentile_window = atr_percentile_window
+
+    @staticmethod
+    def _sma(series: pd.Series, window: int) -> pd.Series:
+        return series.rolling(window).mean()
+
+    @staticmethod
+    def _ema(series: pd.Series, span: int) -> pd.Series:
+        return series.ewm(span=span, adjust=False).mean()
+
+    @staticmethod
+    def _rsi(series: pd.Series, window: int = 14) -> pd.Series:
+        delta = series.diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.ewm(alpha=1 / window, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1 / window, adjust=False).mean()
+        rs = avg_gain / avg_loss.replace(0, np.nan)
+        rsi = 100 - (100 / (1 + rs))
+        return rsi.fillna(50)
+
+    @staticmethod
+    def _macd(series: pd.Series) -> Tuple[pd.Series, pd.Series, pd.Series]:
+        ema12 = FeatureEngineer._ema(series, 12)
+        ema26 = FeatureEngineer._ema(series, 26)
+        macd_line = ema12 - ema26
+        signal_line = FeatureEngineer._ema(macd_line, 9)
+        hist = macd_line - signal_line
+        return macd_line, signal_line, hist
+
+    @staticmethod
+    def _bollinger(series: pd.Series, window: int = 20, num_std: float = 2.0):
+        mid = FeatureEngineer._sma(series, window)
+        std = series.rolling(window).std()
+        upper = mid + num_std * std
+        lower = mid - num_std * std
+        pctb = (series - lower) / (upper - lower).replace(0, np.nan)
+        width = (upper - lower) / mid.replace(0, np.nan)
+        return pctb.fillna(0.5), width.fillna(0)
+
+    @staticmethod
+    def _atr(df: pd.DataFrame, window: int = 14) -> pd.Series:
+        high, low, close = df["high"], df["low"], df["close"]
+        prev_close = close.shift(1)
+        tr = pd.concat(
+            [
+                (high - low),
+                (high - prev_close).abs(),
+                (low - prev_close).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+        atr = tr.ewm(alpha=1 / window, adjust=False).mean()
+        return atr
+
+    @staticmethod
+    def _stochastic(df: pd.DataFrame, window: int = 14, smooth: int = 3):
+        low_min = df["low"].rolling(window).min()
+        high_max = df["high"].rolling(window).max()
+        k = 100 * (df["close"] - low_min) / (high_max - low_min).replace(0, np.nan)
+        k = k.fillna(50)
+        d = k.rolling(smooth).mean().fillna(50)
+        return k, d
+
+    def add_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Return a copy of df with all feature columns (and raw ATR) added."""
+        if df.empty or len(df) < 30:
+            return pd.DataFrame()
+
+        out = df.copy()
+        close = out["close"]
+
+        out["return_1"] = close.pct_change(1)
+        out["return_3"] = close.pct_change(3)
+        out["return_5"] = close.pct_change(5)
+        out["return_10"] = close.pct_change(10)
+
+        out["log_vol_change"] = np.log(out["volume"].replace(0, np.nan)).diff().fillna(0)
+
+        sma5, sma10, sma20 = self._sma(close, 5), self._sma(close, 10), self._sma(close, 20)
+        out["sma_5_ratio"] = close / sma5 - 1
+        out["sma_10_ratio"] = close / sma10 - 1
+        out["sma_20_ratio"] = close / sma20 - 1
+
+        ema12, ema26 = self._ema(close, 12), self._ema(close, 26)
+        out["ema_12_ratio"] = close / ema12 - 1
+        out["ema_26_ratio"] = close / ema26 - 1
+
+        macd_line, signal_line, hist = self._macd(close)
+        out["macd"] = macd_line
+        out["macd_signal"] = signal_line
+        out["macd_hist"] = hist
+
+        out["rsi_14"] = self._rsi(close, 14)
+
+        pctb, width = self._bollinger(close, 20, 2.0)
+        out["bb_pctb"] = pctb
+        out["bb_width"] = width
+
+        atr = self._atr(out, 14)
+        out["atr_14"] = atr
+        out["atr_14_pct"] = atr / close
+
+        stoch_k, stoch_d = self._stochastic(out, 14, 3)
+        out["stoch_k"] = stoch_k
+        out["stoch_d"] = stoch_d
+
+        vol_mean = out["volume"].rolling(20).mean()
+        vol_std = out["volume"].rolling(20).std()
+        out["volume_zscore"] = ((out["volume"] - vol_mean) / vol_std.replace(0, np.nan)).fillna(0)
+
+        out["high_low_range_pct"] = (out["high"] - out["low"]) / close
+        denom = (out["high"] - out["low"]).replace(0, np.nan)
+        out["close_position_in_range"] = ((close - out["low"]) / denom).fillna(0.5)
+
+        out["momentum_10"] = close - close.shift(10)
+        out["volatility_10"] = close.pct_change().rolling(10).std()
+
+        atr_window = self.atr_percentile_window
+        out["atr_percentile"] = atr.rolling(atr_window, min_periods=max(10, atr_window // 4)).rank(pct=True)
+        out["atr_percentile"] = out["atr_percentile"].fillna(0.5)  # neutral until enough history
+
+        out = out.replace([np.inf, -np.inf], np.nan)
+        return out
+
+    def add_labels(self, df: pd.DataFrame, horizon: int) -> pd.DataFrame:
+        """Binary label: 1 if close `horizon` bars ahead is higher than now."""
+        out = df.copy()
+        future_close = out["close"].shift(-horizon)
+        out["target"] = (future_close > out["close"]).astype(int)
+        return out
+
+    def build_dataset(self, raw_bars: pd.DataFrame, horizon: int) -> pd.DataFrame:
+        feats = self.add_features(raw_bars)
+        if feats.empty:
+            return feats
+        labeled = self.add_labels(feats, horizon)
+        cols_needed = self.FEATURE_COLUMNS + ["target", "atr_14", "close"]
+        labeled = labeled.dropna(subset=cols_needed)
+        return labeled
+
+
+# ==============================================================================
+# 4.5 NEWS SENTIMENT (live-only overlay)
+# ==============================================================================
+
+class NewsSentimentAnalyzer:
+    """
+    A lightweight, self-contained sentiment scorer for financial news
+    headlines/summaries. This is a keyword-weighted heuristic, NOT a
+    trained NLP model -- deliberately so, since it means no extra ML
+    dependency to install and nothing to download at runtime; it will run
+    reliably in a plain PyCharm environment out of the box.
+
+    Treat it as a coarse, noisy input: good for "don't buy into a wave of
+    clearly bad headlines" or "don't short into a wave of clearly good
+    ones," not a nuanced read of financial writing. It is intentionally
+    NOT used as a trained-model feature (see FeatureEngineer) -- doing
+    that properly would require backfilling historical news across the
+    entire training window per bar, which is a much larger, more fragile
+    undertaking than a keyword-based live overlay. This only ever gates
+    live trading; it plays no role in --backtest.
+    """
+
+    POSITIVE_TERMS = {
+        "beat", "beats", "beating", "surge", "surges", "surged", "soar", "soars", "soared",
+        "upgrade", "upgraded", "outperform", "outperforms", "record", "growth", "profit",
+        "profits", "profitable", "bullish", "rally", "rallies", "rallied", "strong",
+        "strength", "raise", "raised", "raises", "guidance", "buyback", "expansion",
+        "partnership", "approval", "approved", "breakthrough", "win", "wins", "won",
+        "exceeds", "exceeded", "upbeat", "optimistic", "gain", "gains", "jump", "jumps",
+        "jumped",
+    }
+    NEGATIVE_TERMS = {
+        "miss", "misses", "missed", "plunge", "plunges", "plunged", "slump", "slumps",
+        "downgrade", "downgraded", "underperform", "underperforms", "loss", "losses",
+        "bearish", "selloff", "weak", "weakness", "cut", "cuts", "layoff", "layoffs",
+        "lawsuit", "investigation", "recall", "fraud", "bankruptcy", "default", "warning",
+        "warns", "warned", "decline", "declines", "declined", "drop", "drops", "dropped",
+        "fall", "falls", "fell", "fine", "fined", "penalty", "delay", "delayed", "halt",
+        "halted", "resign", "resigned", "resignation", "probe", "scandal", "slash",
+        "slashed",
+    }
+
+    _WORD_RE = re.compile(r"[a-z']+")
+
+    def score_text(self, text: str) -> float:
+        """Returns a score in [-1, 1]; 0.0 means neutral or no sentiment words found."""
+        if not text:
+            return 0.0
+        words = self._WORD_RE.findall(text.lower())
+        pos = sum(1 for w in words if w in self.POSITIVE_TERMS)
+        neg = sum(1 for w in words if w in self.NEGATIVE_TERMS)
+        total = pos + neg
+        if total == 0:
+            return 0.0
+        return (pos - neg) / total
+
+    def score_articles(self, articles: List[Dict], half_life_hours: float = 12.0) -> float:
+        """
+        Averages sentiment across articles, weighting more recent articles
+        higher via exponential decay (half_life_hours). Returns 0.0
+        (neutral -- never blocks anything) if there are no articles, so a
+        news-fetch failure or empty result degrades safely.
+        """
+        if not articles:
+            return 0.0
+
+        now = datetime.now(timezone.utc)
+        weighted_sum = 0.0
+        weight_total = 0.0
+        for article in articles:
+            text = f"{article.get('headline', '')} {article.get('summary', '')}"
+            score = self.score_text(text)
+            published_at = article.get("created_at")
+            if isinstance(published_at, datetime):
+                age_hours = max(0.0, (now - published_at).total_seconds() / 3600.0)
+            else:
+                age_hours = 0.0
+            weight = 0.5 ** (age_hours / half_life_hours)
+            weighted_sum += score * weight
+            weight_total += weight
+
+        return weighted_sum / weight_total if weight_total > 0 else 0.0
+
+
+# ==============================================================================
+# 5. ML SIGNAL MODEL
+# ==============================================================================
+
+class MLSignalModel:
+    """
+    Wraps a scaler + gradient boosted classifier per symbol. Handles
+    train/retrain-on-schedule, walk-forward validation, persistence, and
+    turning a feature row into a directional probability.
+    """
+
+    def __init__(self, symbol: str, config: TradingConfig, logger: logging.Logger):
+        self.symbol = symbol
+        self.config = config
+        self.logger = logger
+        self.pipeline: Optional[Pipeline] = None
+        self.last_trained_at: Optional[datetime] = None
+        self.last_val_accuracy: float = 0.0
+        self.last_val_auc: float = 0.0
+
+        Path(config.model_dir).mkdir(parents=True, exist_ok=True)
+        self.model_path = Path(config.model_dir) / f"{symbol}_model.joblib"
+        self._try_load()
+
+    # ---------------------------------------------------------------- I/O
+    def _try_load(self) -> None:
+        if not self.model_path.exists():
+            return
+        try:
+            payload = joblib.load(self.model_path)
+            cached_columns = payload.get("feature_columns")
+            if cached_columns != FeatureEngineer.FEATURE_COLUMNS:
+                self.logger.warning(
+                    f"[{self.symbol}] cached model was trained on a different feature "
+                    f"set than the current code -- discarding it and forcing a fresh "
+                    f"retrain instead of risking a dimension-mismatch crash."
+                )
+                return
+            self.pipeline = payload["pipeline"]
+            self.last_trained_at = payload["trained_at"]
+            self.last_val_accuracy = payload.get("val_accuracy", 0.0)
+            self.last_val_auc = payload.get("val_auc", 0.0)
+            self.logger.info(
+                f"[{self.symbol}] loaded cached model "
+                f"(trained_at={self.last_trained_at}, val_acc={self.last_val_accuracy:.3f})"
+            )
+        except Exception as exc:
+            self.logger.warning(f"[{self.symbol}] failed to load cached model: {exc}")
+
+    def _save(self) -> None:
+        payload = {
+            "pipeline": self.pipeline,
+            "trained_at": self.last_trained_at,
+            "val_accuracy": self.last_val_accuracy,
+            "val_auc": self.last_val_auc,
+            "feature_columns": FeatureEngineer.FEATURE_COLUMNS,
+        }
+        joblib.dump(payload, self.model_path)
+
+    # ------------------------------------------------------------ training
+    def needs_retrain(self) -> bool:
+        if self.pipeline is None or self.last_trained_at is None:
+            return True
+        elapsed = datetime.now(timezone.utc) - self.last_trained_at
+        return elapsed >= timedelta(minutes=self.config.retrain_interval_minutes)
+
+    def train(self, dataset: pd.DataFrame) -> bool:
+        """
+        Fit on `dataset` (must contain FEATURE_COLUMNS + target). Uses a
+        walk-forward (TimeSeriesSplit) validation scheme so we never leak
+        future bars into training folds -- important for time series data.
+        Returns True if the resulting model clears the min-accuracy bar.
+        """
+        if len(dataset) < self.config.min_bars_required:
+            self.logger.warning(
+                f"[{self.symbol}] not enough rows to train "
+                f"({len(dataset)} < {self.config.min_bars_required})"
+            )
+            return False
+
+        X = dataset[FeatureEngineer.FEATURE_COLUMNS].values
+        y = dataset["target"].values
+
+        splitter = TimeSeriesSplit(n_splits=5)
+        fold_accuracies, fold_aucs = [], []
+
+        for train_idx, val_idx in splitter.split(X):
+            X_train, X_val = X[train_idx], X[val_idx]
+            y_train, y_val = y[train_idx], y[val_idx]
+
+            pipe = self._build_pipeline()
+            pipe.fit(X_train, y_train)
+            preds = pipe.predict(X_val)
+            probs = pipe.predict_proba(X_val)[:, 1]
+
+            fold_accuracies.append(accuracy_score(y_val, preds))
+            try:
+                fold_aucs.append(roc_auc_score(y_val, probs))
+            except ValueError:
+                pass  # can happen if a fold has only one class present
+
+        val_accuracy = float(np.mean(fold_accuracies)) if fold_accuracies else 0.0
+        val_auc = float(np.mean(fold_aucs)) if fold_aucs else 0.5
+
+        # Final fit on the full dataset for production use
+        final_pipeline = self._build_pipeline()
+        final_pipeline.fit(X, y)
+
+        self.pipeline = final_pipeline
+        self.last_trained_at = datetime.now(timezone.utc)
+        self.last_val_accuracy = val_accuracy
+        self.last_val_auc = val_auc
+        self._save()
+        self._log_feature_importance(final_pipeline)
+
+        self.logger.info(
+            f"[{self.symbol}] retrained | walk-forward acc={val_accuracy:.3f} "
+            f"auc={val_auc:.3f} | n={len(dataset)}"
+        )
+
+        return val_accuracy >= self.config.min_train_accuracy
+
+    @staticmethod
+    def _build_pipeline() -> Pipeline:
+        """
+        Soft-voting ensemble of three complementary model families:
+          - GradientBoostingClassifier: captures non-linear feature
+            interactions, tends to have the highest raw accuracy
+          - RandomForestClassifier: more robust to noisy features than
+            boosting, less prone to overfitting any single quirk in the data
+          - LogisticRegression: a stable linear baseline that keeps the
+            ensemble from being fully dominated by tree-model overfitting
+        Averaging their probability outputs tends to generalize better on
+        noisy financial data than trusting any single model family.
+        """
+        gb = GradientBoostingClassifier(
+            n_estimators=150,
+            max_depth=3,
+            learning_rate=0.05,
+            subsample=0.8,
+            random_state=42,
+        )
+        rf = RandomForestClassifier(
+            n_estimators=250,
+            max_depth=5,
+            min_samples_leaf=10,
+            random_state=42,
+            n_jobs=-1,
+        )
+        lr = LogisticRegression(max_iter=500, C=0.5)
+
+        ensemble = VotingClassifier(
+            estimators=[("gb", gb), ("rf", rf), ("lr", lr)],
+            voting="soft",
+            weights=[2, 2, 1],  # trust the two tree models a bit more than the linear one
+        )
+
+        return Pipeline(steps=[("scaler", StandardScaler()), ("clf", ensemble)])
+
+    def _log_feature_importance(self, pipeline: Pipeline, top_n: int = 6) -> None:
+        """Logs the top contributing features from the tree-based ensemble members."""
+        try:
+            ensemble = pipeline.named_steps["clf"]
+            gb = ensemble.named_estimators_["gb"]
+            rf = ensemble.named_estimators_["rf"]
+            combined = (gb.feature_importances_ + rf.feature_importances_) / 2.0
+            ranked = sorted(
+                zip(FeatureEngineer.FEATURE_COLUMNS, combined),
+                key=lambda pair: pair[1],
+                reverse=True,
+            )[:top_n]
+            summary = ", ".join(f"{name}={score:.3f}" for name, score in ranked)
+            self.logger.info(f"[{self.symbol}] top features: {summary}")
+        except Exception as exc:
+            self.logger.debug(f"[{self.symbol}] feature importance logging skipped: {exc}")
+
+    # ----------------------------------------------------------- inference
+    def predict_proba_up(self, feature_row: pd.Series) -> Optional[float]:
+        if self.pipeline is None:
+            return None
+        X = feature_row[FeatureEngineer.FEATURE_COLUMNS].values.reshape(1, -1)
+        if np.isnan(X).any():
+            return None
+        try:
+            proba = self.pipeline.predict_proba(X)[0, 1]
+            return float(proba)
+        except Exception as exc:
+            self.logger.error(f"[{self.symbol}] prediction failed: {exc}")
+            return None
+
+
+# ==============================================================================
+# 6. SIGNAL (ML + RULE-BASED CONFIRMATION)
+# ==============================================================================
+
+@dataclass
+class Signal:
+    symbol: str
+    action: str          # "BUY", "SELL", "FLAT"
+    confidence: float    # model probability behind the call, 0.5-1.0
+    price: float
+    atr: float
+    reason: str
+
+
+class SignalGenerator:
+    """
+    Combines the ML model's probability estimate with a lightweight
+    rule-based trend filter (price above/below its 20-period SMA) so the
+    model isn't fighting the prevailing trend, and a volatility sanity
+    check so we don't trade when ATR is near zero (illiquid/stale data).
+    """
+
+    def __init__(self, config: TradingConfig, logger: logging.Logger):
+        self.config = config
+        self.logger = logger
+
+    def generate(
+        self,
+        symbol: str,
+        model: MLSignalModel,
+        feature_row: pd.Series,
+        daily_trend: Optional[str] = None,
+        news_sentiment: Optional[float] = None,
+    ) -> Signal:
+        price = float(feature_row["close"])
+        atr = float(feature_row["atr_14"])
+
+        if atr <= 0 or np.isnan(atr):
+            return Signal(symbol, "FLAT", 0.0, price, atr, "invalid ATR")
+
+        if self.config.volatility_regime_filter_enabled:
+            atr_pctile = feature_row.get("atr_percentile")
+            if atr_pctile is not None and not pd.isna(atr_pctile):
+                if atr_pctile < self.config.atr_percentile_min:
+                    return Signal(
+                        symbol, "FLAT", 0.0, price, atr,
+                        f"volatility regime filter: ATR percentile {atr_pctile:.2f} too low (illiquid/dead)",
+                    )
+                if atr_pctile > self.config.atr_percentile_max:
+                    return Signal(
+                        symbol, "FLAT", 0.0, price, atr,
+                        f"volatility regime filter: ATR percentile {atr_pctile:.2f} too high (chaotic/gap risk)",
+                    )
+
+        proba_up = model.predict_proba_up(feature_row)
+        if proba_up is None:
+            return Signal(symbol, "FLAT", 0.0, price, atr, "no model prediction available")
+
+        trend_up = feature_row["sma_5_ratio"] > 0 and feature_row["sma_20_ratio"] > -0.01
+        trend_down = feature_row["sma_5_ratio"] < 0 and feature_row["sma_20_ratio"] < 0.01
+
+        confidence = max(proba_up, 1 - proba_up)
+        if confidence < self.config.min_prediction_confidence:
+            return Signal(symbol, "FLAT", confidence, price, atr, "confidence below threshold")
+
+        # Higher-timeframe (daily) trend must agree with the intraday call,
+        # when daily-trend data is available and the filter is enabled.
+        daily_blocks_long = self.config.require_daily_trend_confirmation and daily_trend == "DOWN"
+        daily_blocks_short = self.config.require_daily_trend_confirmation and daily_trend == "UP"
+
+        # Recent news sentiment must not strongly contradict the call, when
+        # sentiment data is available and the filter is enabled. A neutral
+        # or missing reading (0.0 / None) never blocks anything.
+        news_blocks_long = (
+            self.config.news_sentiment_enabled
+            and news_sentiment is not None
+            and news_sentiment <= self.config.news_sentiment_block_threshold
+        )
+        news_blocks_short = (
+            self.config.news_sentiment_enabled
+            and news_sentiment is not None
+            and news_sentiment >= self.config.news_sentiment_short_block_threshold
+        )
+
+        if proba_up >= self.config.min_prediction_confidence and trend_up:
+
+            if daily_blocks_long:
+                return Signal(
+                    symbol, "FLAT", confidence, price, atr,
+                    "intraday BUY blocked: against daily trend",
+                )
+            if news_blocks_long:
+                return Signal(
+                    symbol, "FLAT", confidence, price, atr,
+                    f"intraday BUY blocked: negative news sentiment ({news_sentiment:.2f})",
+                )
+            return Signal(symbol, "BUY", proba_up, price, atr, "ML up-signal confirmed by trend filter")
+
+        if (1 - proba_up) >= self.config.min_prediction_confidence and trend_down:
+            if daily_blocks_short:
+                return Signal(
+                    symbol, "FLAT", confidence, price, atr,
+                    "intraday SELL blocked: against daily trend",
+                )
+            if news_blocks_short:
+                return Signal(
+                    symbol, "FLAT", confidence, price, atr,
+                    f"intraday SELL blocked: positive news sentiment ({news_sentiment:.2f})",
+                )
+            return Signal(symbol, "SELL", 1 - proba_up, price, atr, "ML down-signal confirmed by trend filter")
+
+        return Signal(symbol, "FLAT", confidence, price, atr, "model/trend disagreement")
+
+
+# ==============================================================================
+# 7. RISK MANAGEMENT
+# ==============================================================================
+
+class RiskManager:
+    """
+    Handles position sizing, stop/take levels, a per-day max-loss kill
+    switch (persisted to disk so a crash/restart mid-day doesn't reset the
+    baseline), and correlation-aware exposure limits so the bot doesn't
+    stack several highly correlated positions (e.g. SPY + QQQ) as if they
+    were independent bets.
+    """
+
+    def __init__(self, config: TradingConfig, logger: logging.Logger):
+        self.config = config
+        self.logger = logger
+        self.session_start_equity: Optional[float] = None
+
+        Path(config.state_dir).mkdir(parents=True, exist_ok=True)
+        self.state_path = Path(config.state_dir) / config.daily_state_file
+        self._load_daily_state()
+
+    # ------------------------------------------------------- daily state
+    def _today_key(self) -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def _load_daily_state(self) -> None:
+        if not self.state_path.exists():
+            return
+        try:
+            payload = json.loads(self.state_path.read_text())
+        except Exception as exc:
+            self.logger.warning(f"Failed to read daily state file: {exc}")
+            return
+
+        if payload.get("date") == self._today_key():
+            self.session_start_equity = payload.get("session_start_equity")
+            if self.session_start_equity is not None:
+                self.logger.info(
+                    f"Restored today's starting equity from disk: "
+                    f"${self.session_start_equity:,.2f}"
+                )
+
+    def _save_daily_state(self) -> None:
+        payload = {"date": self._today_key(), "session_start_equity": self.session_start_equity}
+        try:
+            self.state_path.write_text(json.dumps(payload))
+        except Exception as exc:
+            self.logger.warning(f"Failed to persist daily state: {exc}")
+
+    def set_session_start_equity(self, equity: float) -> None:
+        """
+        Sets the baseline equity used for the daily-loss halt. Persisted to
+        disk and keyed by calendar date, so if the bot restarts mid-session
+        (crash, redeploy, manual stop/start) it does NOT quietly reset to a
+        different baseline -- the halt stays anchored to the same number
+        for the whole trading day.
+        """
+        if self.session_start_equity is None:
+            self.session_start_equity = equity
+            self._save_daily_state()
+            self.logger.info(f"Session starting equity set to ${equity:,.2f}")
+
+    def daily_loss_halt_triggered(self, current_equity: float) -> bool:
+        if self.session_start_equity is None:
+            return False
+        drawdown = (self.session_start_equity - current_equity) / self.session_start_equity
+        if drawdown >= self.config.max_daily_loss_pct:
+            self.logger.warning(
+                f"Daily loss halt triggered: drawdown {drawdown:.2%} "
+                f">= limit {self.config.max_daily_loss_pct:.2%}"
+            )
+            return True
+        return False
+
+    def position_size(
+        self, equity: float, price: float, atr: float, performance_multiplier: float = 1.0
+    ) -> int:
+        """
+        Risk `risk_per_trade_pct` of equity, where the per-share risk is
+        `stop_loss_atr_mult * atr`. Also cap notional exposure per symbol.
+
+        `performance_multiplier` (default 1.0 = neutral) scales the risked
+        dollar amount based on the strategy's recent realized performance --
+        see PerformanceAnalyzer.recent_performance_multiplier. It's clamped
+        to config.adaptive_sizing_{min,max}_multiplier by the caller, so
+        it's applied here without re-clamping.
+        """
+        if price <= 0 or atr <= 0:
+            return 0
+
+        dollars_at_risk = equity * self.config.risk_per_trade_pct * performance_multiplier
+        per_share_risk = self.config.stop_loss_atr_mult * atr
+        if per_share_risk <= 0:
+            return 0
+
+        shares_by_risk = dollars_at_risk / per_share_risk
+
+        max_notional = equity * self.config.max_position_pct_of_equity
+        shares_by_notional = max_notional / price
+
+        shares = int(min(shares_by_risk, shares_by_notional))
+        return max(shares, 0)
+
+    def stop_take_levels(
+        self, entry_price: float, atr: float, side: str, take_mult: Optional[float] = None
+    ) -> Tuple[float, float]:
+        """
+        `take_mult` overrides config.take_profit_atr_mult when set -- used
+        to compute a closer first target for partial scale-out exits
+        without touching the configured "full" target distance.
+        """
+        stop_dist = self.config.stop_loss_atr_mult * atr
+        take_dist = (take_mult if take_mult is not None else self.config.take_profit_atr_mult) * atr
+        if side == "BUY":
+            stop_price = entry_price - stop_dist
+            take_price = entry_price + take_dist
+        else:
+            stop_price = entry_price + stop_dist
+            take_price = entry_price - take_dist
+        return round(stop_price, 2), round(take_price, 2)
+
+    # -------------------------------------------------- correlation caps
+    def correlation_group_for(self, symbol: str) -> Optional[str]:
+        for group_name, members in self.config.correlation_groups.items():
+            if symbol in members:
+                return group_name
+        return None
+
+    def correlation_limit_reached(self, symbol: str, open_position_symbols: List[str]) -> bool:
+        """
+        Returns True if opening a new position in `symbol` would push the
+        count of open positions within its correlation group beyond
+        `max_positions_per_correlation_group`. Symbols not listed in any
+        configured group are treated as uncorrelated and always allowed.
+        """
+        group = self.correlation_group_for(symbol)
+        if group is None:
+            return False
+
+        members = set(self.config.correlation_groups[group])
+        current_count = sum(1 for s in open_position_symbols if s in members)
+
+        if current_count >= self.config.max_positions_per_correlation_group:
+            self.logger.info(
+                f"[{symbol}] correlation cap reached for group '{group}' "
+                f"({current_count}/{self.config.max_positions_per_correlation_group} open)"
+            )
+            return True
+        return False
+
+
+# ==============================================================================
+# 8. ORDER EXECUTION
+# ==============================================================================
+
+class OrderExecutor:
+    def __init__(self, trading_client: TradingClient, config: TradingConfig, logger: logging.Logger):
+        self.client = trading_client
+        self.config = config
+        self.logger = logger
+
+    def get_account(self):
+        return call_with_retry(self.client.get_account, logger=self.logger)
+
+    def get_open_positions(self) -> Dict[str, object]:
+        try:
+            positions = call_with_retry(self.client.get_all_positions, logger=self.logger)
+            return {p.symbol: p for p in positions}
+        except Exception as exc:
+            self.logger.error(f"Failed to fetch positions after retries: {exc}")
+            return {}
+
+    def has_open_orders(self, symbol: str) -> bool:
+        try:
+            req = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])
+            orders = call_with_retry(self.client.get_orders, req, logger=self.logger)
+            return len(orders) > 0
+        except Exception as exc:
+            self.logger.error(f"[{symbol}] failed to check open orders after retries: {exc}")
+            return True  # fail safe: assume there's something pending
+
+    def get_open_stop_legs(self, symbol: str) -> List[object]:
+        """
+        Returns all open stop-loss child orders for `symbol`'s position(s).
+        A symbol can have more than one when partial scale-out is enabled
+        (each scaled-out lot is its own bracket order with its own stop
+        leg), so callers must update every leg returned here, not just one.
+        """
+        try:
+            req = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])
+            orders = call_with_retry(self.client.get_orders, req, logger=self.logger)
+            stop_legs = []
+            for order in orders:
+                order_type = getattr(order, "order_type", None) or getattr(order, "type", None)
+                type_str = order_type.value if hasattr(order_type, "value") else str(order_type)
+                if type_str and "stop" in type_str.lower():
+                    stop_legs.append(order)
+            return stop_legs
+        except Exception as exc:
+            self.logger.error(f"[{symbol}] failed to fetch open stop legs: {exc}")
+            return []
+
+    def get_recent_filled_orders(self, after: datetime, limit: int = 200) -> List[object]:
+        """Returns orders that reached a filled/closed status at or after `after`."""
+        try:
+            req = GetOrdersRequest(status=QueryOrderStatus.CLOSED, after=after, limit=limit)
+            orders = call_with_retry(self.client.get_orders, req, logger=self.logger)
+            return [o for o in orders if getattr(o, "filled_at", None) is not None]
+        except Exception as exc:
+            self.logger.error(f"Failed to fetch recent filled orders after retries: {exc}")
+            return []
+
+    def submit_bracket_order(
+        self,
+        symbol: str,
+        qty: int,
+        side: str,
+        stop_price: float,
+        take_price: float,
+    ) -> Optional[object]:
+        if qty <= 0:
+            self.logger.info(f"[{symbol}] skip order: computed qty <= 0")
+            return None
+
+        order_side = OrderSide.BUY if side == "BUY" else OrderSide.SELL
+
+        if self.config.dry_run:
+            self.logger.info(
+                f"[DRY RUN] Would submit {side} {qty} {symbol} | "
+                f"stop={stop_price} take={take_price}"
+            )
+            return None
+
+        try:
+            request = MarketOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=order_side,
+                time_in_force=TimeInForce.DAY,
+                order_class=OrderClass.BRACKET,
+                stop_loss=StopLossRequest(stop_price=stop_price),
+                take_profit=TakeProfitRequest(limit_price=take_price),
+            )
+            order = self.client.submit_order(request)
+            self.logger.info(
+                f"Submitted {side} bracket order: {qty} {symbol} @ market | "
+                f"stop={stop_price} take={take_price} | order_id={order.id}"
+            )
+            return order
+        except Exception as exc:
+            self.logger.error(f"[{symbol}] order submission failed: {exc}")
+            return None
+
+    def close_position(self, symbol: str) -> bool:
+        if self.config.dry_run:
+            self.logger.info(f"[DRY RUN] Would close position in {symbol}")
+            return True
+        try:
+            self.client.close_position(symbol, ClosePositionRequest(percentage="100"))
+            self.logger.info(f"Closed position in {symbol}")
+            return True
+        except Exception as exc:
+            self.logger.error(f"[{symbol}] failed to close position: {exc}")
+            return False
+
+    def close_all_positions(self) -> None:
+        if self.config.dry_run:
+            self.logger.info("[DRY RUN] Would close all positions")
+            return
+        try:
+            self.client.close_all_positions(cancel_orders=True)
+            self.logger.info("All positions closed, all open orders cancelled.")
+        except Exception as exc:
+            self.logger.error(f"Failed to close all positions: {exc}")
+
+    def replace_stop_order(self, order_id: str, new_stop_price: float) -> bool:
+        """
+        Updates a resting stop order's trigger price in place (used by
+        TrailingStopManager). Deliberately NOT wrapped in call_with_retry --
+        same reasoning as submit_bracket_order: retrying an order-mutating
+        request risks acting twice on a request that actually succeeded but
+        whose response was lost in transit. A single failed attempt here
+        just means the stop stays at its current (still valid) level until
+        the next update cycle, which is a safe failure mode.
+        """
+        if self.config.dry_run:
+            self.logger.info(f"[DRY RUN] Would replace stop order {order_id} -> {new_stop_price}")
+            return True
+        try:
+            self.client.replace_order_by_id(
+                order_id, ReplaceOrderRequest(stop_price=new_stop_price)
+            )
+            return True
+        except Exception as exc:
+            self.logger.error(f"Failed to replace stop order {order_id}: {exc}")
+            return False
+
+
+# ==============================================================================
+# 8.5 TRAILING STOP MANAGEMENT
+# ==============================================================================
+
+class TrailingStopManager:
+    """
+    Manually ratchets each open position's resting stop-loss order tighter
+    as price moves favorably. Alpaca's native trailing-stop order type
+    can't be combined with a bracket order's take-profit leg, so this
+    achieves the same effect by periodically checking each open position
+    and replacing its stop order in place -- only ever tightening, never
+    loosening, so it can't accidentally widen risk on an existing trade.
+    Only acts when `config.trailing_stop` is enabled.
+    """
+
+    def __init__(self, config: TradingConfig, executor: OrderExecutor, logger: logging.Logger):
+        self.config = config
+        self.executor = executor
+        self.logger = logger
+        self._tracked_stops: Dict[str, float] = {}  # symbol -> current stop price we last set
+
+    def reset(self, symbol: str) -> None:
+        """Call when a position is closed, so a new position in the same
+        symbol doesn't inherit a stale tracked stop level."""
+        self._tracked_stops.pop(symbol, None)
+
+    def tracked_symbols(self) -> List[str]:
+        """Symbols currently being trailed, for cleanup by the caller."""
+        return list(self._tracked_stops.keys())
+
+    def update(self, symbol: str, position: object, current_price: float, atr: float) -> None:
+        if not self.config.trailing_stop or atr <= 0 or np.isnan(atr):
+            return
+
+        side = "BUY" if float(position.qty) > 0 else "SELL"
+        trail_dist = self.config.stop_loss_atr_mult * atr
+        candidate_stop = current_price - trail_dist if side == "BUY" else current_price + trail_dist
+        rounded_candidate = round(candidate_stop, 2)
+
+        last_stop = self._tracked_stops.get(symbol)
+        improves = (
+            last_stop is None
+            or (side == "BUY" and rounded_candidate > last_stop)
+            or (side == "SELL" and rounded_candidate < last_stop)
+        )
+        if not improves:
+            return
+
+        orders = self.executor.get_open_stop_legs(symbol)
+        if not orders:
+            self.logger.debug(f"[{symbol}] no open stop leg(s) found, skipping trailing update")
+            return
+
+        any_success = False
+        for order in orders:
+            if self.executor.replace_stop_order(order.id, rounded_candidate):
+                any_success = True
+        if any_success:
+            self._tracked_stops[symbol] = rounded_candidate
+            self.logger.info(
+                f"[{symbol}] trailing stop tightened to {rounded_candidate} "
+                f"({len(orders)} leg(s) updated)"
+            )
+
+
+# ==============================================================================
+# 9. TRADE JOURNAL / BOOKKEEPING
+# ==============================================================================
+
+class TradeJournal:
+    def __init__(self, config: TradingConfig, logger: logging.Logger):
+        self.config = config
+        self.logger = logger
+        Path(config.log_dir).mkdir(parents=True, exist_ok=True)
+        self.trade_log_path = Path(config.log_dir) / config.trade_log_csv
+        self.equity_curve_path = Path(config.log_dir) / config.equity_curve_csv
+        self._ensure_headers()
+
+    def _ensure_headers(self) -> None:
+        if not self.trade_log_path.exists():
+            pd.DataFrame(
+                columns=[
+                    "timestamp", "symbol", "action", "qty", "price",
+                    "stop_price", "take_price", "confidence", "reason",
+                ]
+            ).to_csv(self.trade_log_path, index=False)
+
+        if not self.equity_curve_path.exists():
+            pd.DataFrame(columns=["timestamp", "equity", "cash", "positions_count"]).to_csv(
+                self.equity_curve_path, index=False
+            )
+
+    def log_trade(self, signal: Signal, qty: int, stop_price: float, take_price: float) -> None:
+        row = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "symbol": signal.symbol,
+            "action": signal.action,
+            "qty": qty,
+            "price": signal.price,
+            "stop_price": stop_price,
+            "take_price": take_price,
+            "confidence": round(signal.confidence, 4),
+            "reason": signal.reason,
+        }
+        pd.DataFrame([row]).to_csv(self.trade_log_path, mode="a", header=False, index=False)
+
+    def log_equity(self, equity: float, cash: float, positions_count: int) -> None:
+        row = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "equity": equity,
+            "cash": cash,
+            "positions_count": positions_count,
+        }
+        pd.DataFrame([row]).to_csv(self.equity_curve_path, mode="a", header=False, index=False)
+
+
+# ==============================================================================
+# 9.5 FILL TRACKING & PERFORMANCE ANALYSIS
+# ==============================================================================
+
+class FillTracker:
+    """
+    Polls Alpaca for newly filled orders (both entries and the stop-loss /
+    take-profit legs that close them) and appends them to a fills ledger.
+    This is what lets PerformanceAnalyzer compute *realized* P&L, win rate,
+    and profit factor -- the trade journal alone only records what the bot
+    decided to do, not what actually happened to those positions.
+    """
+
+    def __init__(self, config: TradingConfig, executor: OrderExecutor, logger: logging.Logger):
+        self.config = config
+        self.executor = executor
+        self.logger = logger
+
+        Path(config.log_dir).mkdir(parents=True, exist_ok=True)
+        self.fills_path = Path(config.log_dir) / config.fills_csv
+        Path(config.state_dir).mkdir(parents=True, exist_ok=True)
+        self.seen_ids_path = Path(config.state_dir) / "seen_fill_ids.json"
+
+        self._ensure_header()
+        self._seen_ids = self._load_seen_ids()
+        self._last_poll: datetime = datetime.now(timezone.utc) - timedelta(days=1)
+
+    def _ensure_header(self) -> None:
+        if not self.fills_path.exists():
+            pd.DataFrame(
+                columns=["order_id", "symbol", "side", "qty", "filled_avg_price", "filled_at"]
+            ).to_csv(self.fills_path, index=False)
+
+    def _load_seen_ids(self) -> set:
+        if self.seen_ids_path.exists():
+            try:
+                return set(json.loads(self.seen_ids_path.read_text()))
+            except Exception:
+                return set()
+        return set()
+
+    def _save_seen_ids(self) -> None:
+        try:
+            trimmed = list(self._seen_ids)[-5000:]  # cap file growth
+            self.seen_ids_path.write_text(json.dumps(trimmed))
+        except Exception as exc:
+            self.logger.debug(f"Failed to persist seen fill ids: {exc}")
+
+    def poll_and_record(self) -> int:
+        """Fetches newly filled orders since the last poll and appends any
+        new ones to the fills ledger. Returns the number of new fills recorded."""
+        orders = self.executor.get_recent_filled_orders(self._last_poll)
+        self._last_poll = datetime.now(timezone.utc)
+
+        new_rows = []
+        for order in orders:
+            order_id = str(order.id)
+            if order_id in self._seen_ids:
+                continue
+            try:
+                row = {
+                    "order_id": order_id,
+                    "symbol": order.symbol,
+                    "side": order.side.value if hasattr(order.side, "value") else str(order.side),
+                    "qty": float(order.filled_qty) if order.filled_qty else 0.0,
+                    "filled_avg_price": float(order.filled_avg_price) if order.filled_avg_price else 0.0,
+                    "filled_at": order.filled_at.isoformat() if order.filled_at else "",
+                }
+            except Exception as exc:
+                self.logger.debug(f"Skipping malformed order record: {exc}")
+                continue
+            new_rows.append(row)
+            self._seen_ids.add(order_id)
+
+        if new_rows:
+            pd.DataFrame(new_rows).to_csv(self.fills_path, mode="a", header=False, index=False)
+            self._save_seen_ids()
+            self.logger.info(f"Recorded {len(new_rows)} new fill(s) to {self.fills_path.name}")
+
+        return len(new_rows)
+
+
+class PerformanceAnalyzer:
+    """
+    Reads the equity curve and realized fills off disk and computes the
+    metrics that actually matter for judging a strategy -- not just
+    directional accuracy, but risk-adjusted return, drawdown, and whether
+    winning trades are big enough to pay for the losers.
+    """
+
+    def __init__(self, config: TradingConfig, logger: Optional[logging.Logger] = None):
+        self.config = config
+        self.logger = logger or logging.getLogger("alpaca_ml_bot")
+        self.equity_curve_path = Path(config.log_dir) / config.equity_curve_csv
+        self.fills_path = Path(config.log_dir) / config.fills_csv
+
+    def _load_equity_curve(self) -> pd.DataFrame:
+        if not self.equity_curve_path.exists():
+            return pd.DataFrame()
+        df = pd.read_csv(self.equity_curve_path, parse_dates=["timestamp"])
+        return df.dropna(subset=["equity"]).sort_values("timestamp")
+
+    def _load_fills(self) -> pd.DataFrame:
+        if not self.fills_path.exists():
+            return pd.DataFrame()
+        df = pd.read_csv(self.fills_path, parse_dates=["filled_at"])
+        return df.dropna(subset=["filled_at"]).sort_values("filled_at")
+
+    @staticmethod
+    def _max_drawdown(equity: pd.Series) -> float:
+        running_max = equity.cummax()
+        drawdown = (equity - running_max) / running_max
+        return float(drawdown.min()) if len(drawdown) else 0.0
+
+    @staticmethod
+    def _sharpe_ratio(equity: pd.Series, periods_per_year: float) -> float:
+        returns = equity.pct_change().dropna()
+        if returns.std() == 0 or len(returns) < 2:
+            return 0.0
+        return float((returns.mean() / returns.std()) * np.sqrt(periods_per_year))
+
+    def _realized_pnl_by_symbol(self, fills: pd.DataFrame) -> pd.DataFrame:
+        """
+        FIFO-matches buy/sell fills per symbol to compute realized P&L per
+        round trip. This is an approximation -- it assumes fills arrive in
+        the order Alpaca reports them and doesn't account for partial fills
+        spanning multiple orders, but it's a reasonable, honest estimate.
+        """
+        records = []
+        for symbol, group in fills.groupby("symbol"):
+            open_lots: List[Tuple[float, float]] = []  # (signed_qty, price)
+            for _, fill in group.sort_values("filled_at").iterrows():
+                qty = fill["qty"] if fill["side"] == "buy" else -fill["qty"]
+                price = fill["filled_avg_price"]
+
+                while qty != 0 and open_lots:
+                    lot_qty, lot_price = open_lots[0]
+                    if (lot_qty > 0 and qty > 0) or (lot_qty < 0 and qty < 0):
+                        break  # same direction as the resting lot -- nothing to offset
+
+                    matched = min(abs(qty), abs(lot_qty))
+                    direction = 1 if lot_qty > 0 else -1
+                    pnl = direction * matched * (price - lot_price)
+                    records.append({"symbol": symbol, "qty": matched, "pnl": pnl})
+
+                    lot_qty += -direction * matched
+                    qty += direction * matched
+                    if lot_qty == 0:
+                        open_lots.pop(0)
+                    else:
+                        open_lots[0] = (lot_qty, lot_price)
+
+                if qty != 0:
+                    open_lots.append((qty, price))
+
+        return pd.DataFrame(records)
+
+    def recent_performance_multiplier(
+        self,
+        lookback_trades: int = 20,
+        min_multiplier: float = 0.5,
+        max_multiplier: float = 1.5,
+    ) -> float:
+        """
+        Maps recent realized performance to a position-sizing multiplier,
+        so the bot scales risk down after a stretch of losing trades and
+        back up once it's demonstrated an edge -- rather than sizing every
+        trade identically regardless of how the strategy has actually been
+        performing. Returns 1.0 (neutral) until there's enough closed-trade
+        history to judge, and never fully zeroes out sizing even in a bad
+        stretch (bounded by min_multiplier).
+
+        The mapping is centered on profit_factor=1.5 (a reasonable "this is
+        working" threshold) -> multiplier 1.0, with a 0.5x/point slope,
+        clamped to [min_multiplier, max_multiplier].
+        """
+        fills_df = self._load_fills()
+        if fills_df.empty:
+            return 1.0
+
+        pnl_df = self._realized_pnl_by_symbol(fills_df)
+        if len(pnl_df) < max(10, lookback_trades // 2):
+            return 1.0  # not enough closed-trade history to judge yet
+
+        recent = pnl_df.tail(lookback_trades)
+        gross_profit = recent[recent["pnl"] > 0]["pnl"].sum()
+        gross_loss = -recent[recent["pnl"] <= 0]["pnl"].sum()
+        profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else 2.0
+
+        multiplier = 1.0 + (profit_factor - 1.5) * 0.5
+        return float(np.clip(multiplier, min_multiplier, max_multiplier))
+
+    def generate_report(self, periods_per_year: float = 252 * 26) -> str:
+        """
+        `periods_per_year` defaults to a rough estimate for 15-minute bars
+        during a 6.5-hour trading day (~26 bars/day * 252 trading days/year).
+        Adjust the argument if your configured timeframe differs.
+        """
+        lines = ["=" * 60, "PERFORMANCE REPORT", "=" * 60]
+
+        equity_df = self._load_equity_curve()
+        if equity_df.empty:
+            lines.append("No equity curve data yet -- run the bot first.")
+        else:
+            equity = equity_df["equity"]
+            total_return = (equity.iloc[-1] / equity.iloc[0]) - 1
+            sharpe = self._sharpe_ratio(equity, periods_per_year)
+            max_dd = self._max_drawdown(equity)
+
+            lines.append(f"Period: {equity_df['timestamp'].iloc[0]} -> {equity_df['timestamp'].iloc[-1]}")
+            lines.append(f"Starting equity:   ${equity.iloc[0]:,.2f}")
+            lines.append(f"Latest equity:     ${equity.iloc[-1]:,.2f}")
+            lines.append(f"Total return:      {total_return:.2%}")
+            lines.append(f"Max drawdown:      {max_dd:.2%}")
+            lines.append(f"Sharpe (approx.):  {sharpe:.2f}")
+
+        fills_df = self._load_fills()
+        if fills_df.empty:
+            lines.append("\nNo recorded fills yet -- realized P&L stats unavailable.")
+        else:
+            pnl_df = self._realized_pnl_by_symbol(fills_df)
+            if pnl_df.empty:
+                lines.append("\nFills recorded but no closed round trips yet.")
+            else:
+                wins = pnl_df[pnl_df["pnl"] > 0]
+                losses = pnl_df[pnl_df["pnl"] <= 0]
+                win_rate = len(wins) / len(pnl_df) if len(pnl_df) else 0.0
+                gross_profit = wins["pnl"].sum()
+                gross_loss = -losses["pnl"].sum()
+                profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float("inf")
+
+                lines.append("")
+                lines.append(f"Closed round trips: {len(pnl_df)}")
+                lines.append(f"Win rate:           {win_rate:.2%}")
+                lines.append(f"Avg win:            ${wins['pnl'].mean():.2f}" if len(wins) else "Avg win:            n/a")
+                lines.append(f"Avg loss:           ${losses['pnl'].mean():.2f}" if len(losses) else "Avg loss:           n/a")
+                lines.append(f"Profit factor:      {profit_factor:.2f}")
+                lines.append(f"Total realized P&L: ${pnl_df['pnl'].sum():.2f}")
+
+                lines.append("\nBy symbol:")
+                by_symbol = pnl_df.groupby("symbol")["pnl"].agg(["count", "sum", "mean"])
+                for symbol, row in by_symbol.iterrows():
+                    lines.append(
+                        f"  {symbol:<6} trades={int(row['count']):<4} "
+                        f"total=${row['sum']:>9.2f}  avg=${row['mean']:>7.2f}"
+                    )
+
+        lines.append("=" * 60)
+        return "\n".join(lines)
+
+
+# ==============================================================================
+# 9.7 BACKTESTING ENGINE (offline, no live orders)
+# ==============================================================================
+
+class Backtester:
+    """
+    Runs the same feature/model/signal/risk logic against historical bars
+    only -- no orders ever reach Alpaca. Splits each symbol's history
+    chronologically into a training window and a held-out test window,
+    trains a fresh model on the training window only, then walks bar-by-bar
+    through the test window simulating entries/exits with a simple
+    spread+slippage cost model.
+
+    This is a SIMPLIFICATION of real execution: fills are assumed to happen
+    at the bar's close price plus/minus the configured cost in basis
+    points, stops/takes are checked against each subsequent bar's high/low,
+    and there's no modeling of partial fills, order queue position, or
+    latency. The daily-trend confirmation filter is skipped here since this
+    fetches only the intraday timeframe. Treat results as a sanity check,
+    not a profitability guarantee.
+    """
+
+    def __init__(
+        self,
+        config: TradingConfig,
+        data_feed: AlpacaDataFeed,
+        feature_engineer: FeatureEngineer,
+        logger: logging.Logger,
+    ):
+        self.config = config
+        self.data_feed = data_feed
+        self.feature_engineer = feature_engineer
+        self.logger = logger
+        self.signal_generator = SignalGenerator(config, logger)
+        self.risk_manager = RiskManager(config, logger)
+
+    def _cost_multiplier(self, side: str, is_entry: bool) -> float:
+        """Applies half the round-trip spread+slippage cost on each leg."""
+        bps = (self.config.backtest_spread_bps + self.config.backtest_slippage_bps) / 2.0
+        cost_frac = bps / 10_000.0
+        buying = (side == "BUY") == is_entry
+        return (1 + cost_frac) if buying else (1 - cost_frac)
+
+    def run_symbol(self, symbol: str, starting_equity: float = 100_000.0) -> Optional[Dict]:
+        raw_bars = self.data_feed.fetch_bars(symbol)
+        if raw_bars.empty:
+            self.logger.warning(f"[{symbol}] no historical bars for backtest")
+            return None
+
+        dataset = self.feature_engineer.build_dataset(raw_bars, self.config.prediction_horizon_bars)
+        if len(dataset) < self.config.min_bars_required:
+            self.logger.warning(f"[{symbol}] not enough bars for a meaningful backtest")
+            return None
+
+        split_idx = int(len(dataset) * (1 - self.config.backtest_test_fraction))
+        train_df = dataset.iloc[:split_idx]
+        test_df = dataset.iloc[split_idx:]
+        if len(test_df) < 30:
+            self.logger.warning(f"[{symbol}] test window too short, adjust backtest_test_fraction")
+            return None
+
+        model = MLSignalModel(f"{symbol}_backtest", self.config, self.logger)
+        model.train(train_df)
+        if model.pipeline is None:
+            self.logger.warning(f"[{symbol}] backtest model failed to train")
+            return None
+
+        equity = starting_equity
+        equity_curve = [equity]
+        position: Optional[Dict] = None
+        trades: List[Dict] = []
+
+        for i in range(len(test_df) - 1):
+            row = test_df.iloc[i]
+            next_row = test_df.iloc[i + 1]
+
+            if position is not None:
+                position["bars_held"] += 1
+                hit_stop = (
+                    next_row["low"] <= position["stop"] if position["side"] == "BUY"
+                    else next_row["high"] >= position["stop"]
+                )
+                hit_take = (
+                    next_row["high"] >= position["take"] if position["side"] == "BUY"
+                    else next_row["low"] <= position["take"]
+                )
+                time_exit = position["bars_held"] >= self.config.prediction_horizon_bars * 3
+
+                exit_price = None
+                if hit_stop:
+                    exit_price = position["stop"]
+                elif hit_take:
+                    exit_price = position["take"]
+                elif time_exit:
+                    exit_price = next_row["close"]
+
+                if exit_price is not None:
+                    cost_mult = self._cost_multiplier(position["side"], is_entry=False)
+                    effective_exit = exit_price * cost_mult
+                    direction = 1 if position["side"] == "BUY" else -1
+                    pnl = direction * position["qty"] * (effective_exit - position["entry_price"])
+                    equity += pnl
+                    trades.append({
+                        "symbol": symbol,
+                        "side": position["side"],
+                        "qty": position["qty"],
+                        "entry_price": position["entry_price"],
+                        "exit_price": effective_exit,
+                        "pnl": pnl,
+                    })
+                    position = None
+
+            if position is None:
+                signal = self.signal_generator.generate(symbol, model, row, daily_trend=None)
+                if signal.action in ("BUY", "SELL"):
+                    qty = self.risk_manager.position_size(equity, signal.price, signal.atr)
+                    if qty > 0:
+                        cost_mult = self._cost_multiplier(signal.action, is_entry=True)
+                        entry_price = signal.price * cost_mult
+                        stop, take = self.risk_manager.stop_take_levels(signal.price, signal.atr, signal.action)
+                        position = {
+                            "side": signal.action,
+                            "qty": qty,
+                            "entry_price": entry_price,
+                            "stop": stop,
+                            "take": take,
+                            "bars_held": 0,
+                        }
+
+            equity_curve.append(equity)
+
+        equity_series = pd.Series(equity_curve)
+        max_dd = PerformanceAnalyzer._max_drawdown(equity_series)
+        sharpe = PerformanceAnalyzer._sharpe_ratio(equity_series, periods_per_year=252 * 26)
+
+        trades_df = pd.DataFrame(trades)
+        win_rate = float((trades_df["pnl"] > 0).mean()) if len(trades_df) else 0.0
+        total_return = (equity / starting_equity) - 1
+
+        result = {
+            "symbol": symbol,
+            "n_trades": len(trades_df),
+            "win_rate": win_rate,
+            "total_return": total_return,
+            "final_equity": equity,
+            "max_drawdown": max_dd,
+            "sharpe_approx": sharpe,
+            "model_val_accuracy": model.last_val_accuracy,
+        }
+
+        # Clean up the throwaway backtest model file so it doesn't get
+        # confused with the live model cache.
+        try:
+            if model.model_path.exists():
+                model.model_path.unlink()
+        except Exception:
+            pass
+
+        return result
+
+    def run(self) -> pd.DataFrame:
+        results = []
+        for symbol in self.config.symbols:
+            self.logger.info(f"[{symbol}] running backtest...")
+            result = self.run_symbol(symbol)
+            if result is not None:
+                results.append(result)
+                self.logger.info(
+                    f"[{symbol}] backtest: trades={result['n_trades']} "
+                    f"win_rate={result['win_rate']:.2%} "
+                    f"return={result['total_return']:.2%} "
+                    f"max_dd={result['max_drawdown']:.2%} "
+                    f"sharpe~={result['sharpe_approx']:.2f}"
+                )
+        results_df = pd.DataFrame(results)
+        if not results_df.empty:
+            out_dir = Path(self.config.log_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = out_dir / "backtest_results.csv"
+            results_df.to_csv(out_path, index=False)
+            self.logger.info(f"Backtest results written to {out_path}")
+        return results_df
+
+
+# ==============================================================================
+# 10. TRADING BOT ORCHESTRATOR
+# ==============================================================================
+
+class TradingBot:
+    def __init__(self, config: TradingConfig):
+        self.config = config
+        self.logger = build_logger(config.log_dir)
+        self._safety_check()
+
+        self.trading_client = TradingClient(
+            config.api_key, config.secret_key, paper=config.paper
+        )
+        self.data_feed = AlpacaDataFeed(config, self.trading_client, self.logger)
+        self.feature_engineer = FeatureEngineer(atr_percentile_window=config.atr_percentile_window)
+        self.signal_generator = SignalGenerator(config, self.logger)
+        self.risk_manager = RiskManager(config, self.logger)
+        self.executor = OrderExecutor(self.trading_client, config, self.logger)
+        self.journal = TradeJournal(config, self.logger)
+
+        self.models: Dict[str, MLSignalModel] = {
+            symbol: MLSignalModel(symbol, config, self.logger) for symbol in config.symbols
+        }
+        self.fill_tracker = FillTracker(config, self.executor, self.logger)
+        self.trailing_stop_manager = TrailingStopManager(config, self.executor, self.logger)
+        self.performance_analyzer = PerformanceAnalyzer(config, self.logger)
+        self.news_sentiment_analyzer = NewsSentimentAnalyzer()
+
+        self.kill_switch_path = Path(config.kill_switch_file)
+        self.halted = False
+
+        # symbol -> (last_checked_at, "UP"/"DOWN"/None)
+        self._daily_trend_cache: Dict[str, Tuple[datetime, Optional[str]]] = {}
+
+        # symbol -> (last_checked_at, sentiment_score)
+        self._news_sentiment_cache: Dict[str, Tuple[datetime, float]] = {}
+
+        # cached adaptive sizing multiplier, refreshed on its own schedule
+        self._performance_multiplier: float = 1.0
+        self._performance_multiplier_checked_at: Optional[datetime] = None
+
+        Path(config.state_dir).mkdir(parents=True, exist_ok=True)
+        self.heartbeat_path = Path(config.state_dir) / config.heartbeat_file
+
+    def _write_heartbeat(self, status: str, extra: Optional[Dict] = None) -> None:
+        """
+        Writes a small JSON status file on every loop pass so an external
+        watchdog (a cron job, a separate monitoring script, etc.) can tell
+        the bot is still alive and what it's doing -- without one, a silent
+        crash or a stuck process looks identical to normal weekend downtime
+        from the outside.
+        """
+        payload = {
+            "status": status,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "symbols": self.config.symbols,
+        }
+        if extra:
+            payload.update(extra)
+        try:
+            self.heartbeat_path.write_text(json.dumps(payload, default=str))
+        except Exception as exc:
+            self.logger.debug(f"Failed to write heartbeat: {exc}")
+
+    # ------------------------------------------------------------ safety
+    def _safety_check(self) -> None:
+        if not self.config.paper:
+            raise RuntimeError(
+                "Refusing to start: TradingConfig.paper is False. "
+                "This script is restricted to Alpaca PAPER trading."
+            )
+        if not self.config.api_key or not self.config.secret_key:
+            raise RuntimeError(
+                "Missing Alpaca API credentials. Set APCA_API_KEY_ID and "
+                "APCA_API_SECRET_KEY environment variables."
+            )
+
+    def _kill_switch_active(self) -> bool:
+        return self.kill_switch_path.exists()
+
+    def _get_daily_trend(self, symbol: str) -> Optional[str]:
+        """Cached daily-trend lookup so we don't hit the daily-bars endpoint
+        every single poll cycle -- the daily trend can't meaningfully change
+        faster than `daily_trend_refresh_minutes`."""
+        cached = self._daily_trend_cache.get(symbol)
+        now = datetime.now(timezone.utc)
+        if cached is not None:
+            checked_at, trend = cached
+            if now - checked_at < timedelta(minutes=self.config.daily_trend_refresh_minutes):
+                return trend
+
+        trend = self.data_feed.fetch_daily_trend(symbol, self.config.daily_trend_sma_period)
+        self._daily_trend_cache[symbol] = (now, trend)
+        return trend
+
+    def _get_news_sentiment(self, symbol: str) -> Optional[float]:
+        """Cached news-sentiment lookup so we don't re-fetch and re-score
+        news every single poll cycle -- refreshed on its own schedule since
+        sentiment from a wave of headlines doesn't meaningfully change
+        faster than `news_sentiment_refresh_minutes`."""
+        cached = self._news_sentiment_cache.get(symbol)
+        now = datetime.now(timezone.utc)
+        if cached is not None:
+            checked_at, score = cached
+            if now - checked_at < timedelta(minutes=self.config.news_sentiment_refresh_minutes):
+                return score
+
+        articles = self.data_feed.fetch_recent_news(symbol, self.config.news_lookback_hours)
+        score = self.news_sentiment_analyzer.score_articles(articles)
+        self._news_sentiment_cache[symbol] = (now, score)
+        return score
+
+    def _get_performance_multiplier(self) -> float:
+        """Cached adaptive-sizing multiplier, refreshed on its own schedule
+        since it only needs to react to slow-moving realized performance,
+        not every single poll cycle."""
+        if not self.config.adaptive_sizing_enabled:
+            return 1.0
+
+        now = datetime.now(timezone.utc)
+        if self._performance_multiplier_checked_at is not None:
+            elapsed = now - self._performance_multiplier_checked_at
+            if elapsed < timedelta(minutes=self.config.adaptive_sizing_refresh_minutes):
+                return self._performance_multiplier
+
+        multiplier = self.performance_analyzer.recent_performance_multiplier(
+            lookback_trades=self.config.adaptive_sizing_lookback_trades,
+            min_multiplier=self.config.adaptive_sizing_min_multiplier,
+            max_multiplier=self.config.adaptive_sizing_max_multiplier,
+        )
+        if abs(multiplier - self._performance_multiplier) > 1e-6:
+            self.logger.info(f"Adaptive position-sizing multiplier updated to {multiplier:.2f}x")
+        self._performance_multiplier = multiplier
+        self._performance_multiplier_checked_at = now
+        return multiplier
+
+    # ------------------------------------------------------------- model
+    def _train_symbol(self, symbol: str) -> None:
+        model = self.models[symbol]
+        raw_bars = self.data_feed.fetch_bars(symbol)
+        if raw_bars.empty:
+            self.logger.warning(f"[{symbol}] no bar data returned, skipping training")
+            return
+
+        dataset = self.feature_engineer.build_dataset(
+            raw_bars, self.config.prediction_horizon_bars
+        )
+        if dataset.empty:
+            self.logger.warning(f"[{symbol}] feature dataset empty after cleaning, skipping training")
+            return
+
+        model.train(dataset)
+
+    def _maybe_retrain_all(self) -> None:
+        for symbol, model in self.models.items():
+            if model.needs_retrain():
+                self.logger.info(f"[{symbol}] retraining model...")
+                try:
+                    self._train_symbol(symbol)
+                except Exception as exc:
+                    self.logger.error(f"[{symbol}] training raised an exception: {exc}")
+                    self.logger.debug(traceback.format_exc())
+
+    # ------------------------------------------------------------- core
+    def _process_symbol(
+        self,
+        symbol: str,
+        equity: float,
+        open_positions: Dict[str, object],
+        minutes_to_close: Optional[float],
+    ) -> None:
+        model = self.models[symbol]
+        if model.pipeline is None:
+            self.logger.info(f"[{symbol}] no trained model yet, skipping")
+            return
+
+        raw_bars = self.data_feed.fetch_bars(symbol)
+        if raw_bars.empty or len(raw_bars) < 30:
+            self.logger.info(f"[{symbol}] insufficient bar data, skipping")
+            return
+
+        features = self.feature_engineer.add_features(raw_bars)
+        if features.empty:
+            return
+        latest = features.iloc[-1]
+
+        if latest[FeatureEngineer.FEATURE_COLUMNS].isna().any():
+            self.logger.info(f"[{symbol}] latest feature row has NaNs, skipping")
+            return
+
+        daily_trend = self._get_daily_trend(symbol) if self.config.require_daily_trend_confirmation else None
+        signal = self.signal_generator.generate(symbol, model, latest, daily_trend=daily_trend)
+        already_in_position = symbol in open_positions
+
+        self.logger.info(
+            f"[{symbol}] signal={signal.action} conf={signal.confidence:.3f} "
+            f"price={signal.price:.2f} reason='{signal.reason}' "
+            f"in_position={already_in_position}"
+        )
+
+        # --- Exit logic: if we're in a position and the model flips, flatten ---
+        if already_in_position:
+            position = open_positions[symbol]
+            position_side = "BUY" if float(position.qty) > 0 else "SELL"
+            if signal.action != "FLAT" and signal.action != position_side:
+                self.logger.info(f"[{symbol}] model flipped against open position, closing")
+                self.executor.close_position(symbol)
+                self.trailing_stop_manager.reset(symbol)
+            else:
+                self.trailing_stop_manager.update(symbol, position, signal.price, signal.atr)
+            return  # bracket order already manages stop/take on the resting order
+
+        # --- No new entries if we're too close to the close ---
+        if minutes_to_close is not None and minutes_to_close <= self.config.entry_cutoff_minutes_before_close:
+            return
+
+        # --- No new entries beyond max_positions ---
+        if len(open_positions) >= self.config.max_positions:
+            return
+
+        if signal.action == "FLAT":
+            return
+
+        if self.risk_manager.correlation_limit_reached(symbol, list(open_positions.keys())):
+            return
+
+        performance_multiplier = self._get_performance_multiplier()
+        qty = self.risk_manager.position_size(
+            equity, signal.price, signal.atr, performance_multiplier=performance_multiplier
+        )
+        if qty <= 0:
+            return
+
+        if self.executor.has_open_orders(symbol):
+            self.logger.info(f"[{symbol}] already has open orders, skipping new entry")
+            return
+
+        self._submit_entry(symbol, signal, qty)
+
+    def _submit_entry(self, symbol: str, signal: Signal, qty: int) -> None:
+        """
+        Submits the entry order(s) for a new position. When partial
+        scale-out is enabled and qty is large enough to split meaningfully,
+        this submits two smaller bracket orders sharing the same stop but
+        with two different take-profit targets -- a closer one for the
+        first lot (locks in partial profit early) and the full configured
+        target for the second lot (lets a genuine trend keep running).
+        Falls back to a single bracket order for small quantities or when
+        scale-out is disabled.
+        """
+        stop_price, full_take_price = self.risk_manager.stop_take_levels(
+            signal.price, signal.atr, signal.action
+        )
+
+        can_split = self.config.enable_partial_scale_out and qty >= 2
+        if not can_split:
+            order = self.executor.submit_bracket_order(
+                symbol, qty, signal.action, stop_price, full_take_price
+            )
+            if order is not None or self.config.dry_run:
+                self.journal.log_trade(signal, qty, stop_price, full_take_price)
+            return
+
+        qty_first = max(1, int(qty * self.config.scale_out_fraction))
+        qty_second = qty - qty_first
+        if qty_second < 1:
+            qty_first = qty - 1
+            qty_second = 1
+
+        _, near_take_price = self.risk_manager.stop_take_levels(
+            signal.price, signal.atr, signal.action,
+            take_mult=self.config.scale_out_first_target_atr_mult,
+        )
+
+        order1 = self.executor.submit_bracket_order(
+            symbol, qty_first, signal.action, stop_price, near_take_price
+        )
+        if order1 is not None or self.config.dry_run:
+            self.journal.log_trade(signal, qty_first, stop_price, near_take_price)
+
+        order2 = self.executor.submit_bracket_order(
+            symbol, qty_second, signal.action, stop_price, full_take_price
+        )
+        if order2 is not None or self.config.dry_run:
+            self.journal.log_trade(signal, qty_second, stop_price, full_take_price)
+
+    def _flatten_for_close(self) -> None:
+        self.logger.info("Approaching market close: flattening all positions.")
+        self.executor.close_all_positions()
+
+    # -------------------------------------------------------------- run
+    def run(self) -> None:
+        self.logger.info("=" * 78)
+        self.logger.info("Starting Alpaca ML Trading Bot (PAPER)")
+        self.logger.info(f"Symbols: {', '.join(self.config.symbols)}")
+        self.logger.info(f"Timeframe: {self.config.timeframe_amount} {self.config.timeframe_unit}")
+        self.logger.info(f"Dry run: {self.config.dry_run}")
+        self.logger.info("=" * 78)
+
+        # Initial model training before the loop starts
+        self._maybe_retrain_all()
+
+        try:
+            while True:
+                if self._kill_switch_active():
+                    self.logger.warning(
+                        f"Kill switch file '{self.config.kill_switch_file}' detected. "
+                        "Flattening positions and stopping."
+                    )
+                    self.executor.close_all_positions()
+                    self._write_heartbeat("stopped_kill_switch")
+                    break
+
+                if not self.data_feed.is_market_open():
+                    self.logger.info("Market closed. Sleeping until next check...")
+                    self._write_heartbeat("market_closed")
+                    time.sleep(max(self.config.poll_interval_seconds, 60))
+                    continue
+
+                try:
+                    account = self.executor.get_account()
+                    equity = float(account.equity)
+                    cash = float(account.cash)
+                except Exception as exc:
+                    self.logger.error(f"Failed to fetch account info: {exc}")
+                    self._write_heartbeat("error", {"detail": str(exc)})
+                    time.sleep(self.config.poll_interval_seconds)
+                    continue
+
+                self.risk_manager.set_session_start_equity(equity)
+
+                if self.risk_manager.daily_loss_halt_triggered(equity):
+                    if not self.halted:
+                        self.logger.warning("Max daily loss hit. Halting new trades and flattening.")
+                        self.executor.close_all_positions()
+                        self.halted = True
+                    self._write_heartbeat("halted_daily_loss", {"equity": equity})
+                    time.sleep(self.config.poll_interval_seconds)
+                    continue
+
+                self._maybe_retrain_all()
+
+                minutes_to_close = self.data_feed.minutes_to_close()
+                open_positions = self.executor.get_open_positions()
+
+                # A position may have closed on its own (stop/take fill) since
+                # the last cycle -- clear its trailing-stop tracking so a new
+                # trade in the same symbol starts fresh instead of being
+                # compared against a stale prior stop level.
+                for tracked_symbol in self.trailing_stop_manager.tracked_symbols():
+                    if tracked_symbol not in open_positions:
+                        self.trailing_stop_manager.reset(tracked_symbol)
+
+                if (
+                    minutes_to_close is not None
+                    and minutes_to_close <= self.config.flatten_before_close_minutes
+                ):
+                    self._flatten_for_close()
+                    self._write_heartbeat("flattening_for_close", {"equity": equity})
+                    time.sleep(self.config.poll_interval_seconds)
+                    continue
+
+                for symbol in self.config.symbols:
+                    try:
+                        self._process_symbol(symbol, equity, open_positions, minutes_to_close)
+                    except Exception as exc:
+                        self.logger.error(f"[{symbol}] error while processing: {exc}")
+                        self.logger.debug(traceback.format_exc())
+
+                self.journal.log_equity(equity, cash, len(open_positions))
+                self.fill_tracker.poll_and_record()
+                self._write_heartbeat(
+                    "running",
+                    {"equity": equity, "cash": cash, "open_positions": len(open_positions)},
+                )
+
+                time.sleep(self.config.poll_interval_seconds)
+
+        except KeyboardInterrupt:
+            self.logger.info("Keyboard interrupt received. Shutting down gracefully.")
+        finally:
+            self.logger.info("Bot stopped.")
+
+
+# ==============================================================================
+# 11. CLI ENTRY POINT
+# ==============================================================================
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Alpaca ML intraday trading bot (paper trading only)."
+    )
+    parser.add_argument("--symbols", nargs="+", default=None, help="Ticker symbols to trade")
+    parser.add_argument("--timeframe-amount", type=int, default=None)
+    parser.add_argument("--timeframe-unit", type=str, default=None, choices=["Minute", "Hour", "Day"])
+    parser.add_argument("--lookback-days", type=int, default=None)
+    parser.add_argument("--retrain-interval-minutes", type=int, default=None)
+    parser.add_argument("--poll-interval-seconds", type=int, default=None)
+    parser.add_argument("--risk-per-trade-pct", type=float, default=None)
+    parser.add_argument("--max-positions", type=int, default=None)
+    parser.add_argument("--max-daily-loss-pct", type=float, default=None)
+    parser.add_argument("--min-prediction-confidence", type=float, default=None)
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help=(
+            "Path to a JSON file overriding TradingConfig defaults (any subset of "
+            "field names/values). Applied before the individual --flag overrides "
+            "above, so a specific CLI flag always wins over the config file."
+        ),
+    )
+    parser.add_argument(
+        "--dump-config",
+        type=str,
+        default=None,
+        help=(
+            "Write the fully-resolved config (defaults + --config file + CLI flags) "
+            "to this JSON path and exit without trading. Handy for generating a "
+            "starting point to hand-edit and reuse with --config next time."
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Compute signals/orders but never actually submit them.",
+    )
+    parser.add_argument(
+        "--backtest",
+        action="store_true",
+        help="Run an offline backtest over historical data instead of live/paper trading.",
+    )
+    parser.add_argument(
+        "--report",
+        action="store_true",
+        help="Print a performance report from existing logs and exit (no trading, no API calls).",
+    )
+    return parser.parse_args()
+
+
+def load_config_overrides(path: str) -> Dict:
+    p = Path(path)
+    if not p.exists():
+        raise SystemExit(f"Config file not found: {path}")
+    try:
+        data = json.loads(p.read_text())
+    except Exception as exc:
+        raise SystemExit(f"Failed to parse config file {path}: {exc}")
+    if not isinstance(data, dict):
+        raise SystemExit(f"Config file {path} must contain a JSON object of field:value pairs")
+    return data
+
+
+def build_config_from_args(args: argparse.Namespace) -> TradingConfig:
+    config = TradingConfig()
+
+    # 1. Config file, if given -- lowest precedence override (above the defaults).
+    if args.config:
+        file_overrides = load_config_overrides(args.config)
+        valid_field_names = {f.name for f in fields(config)}
+        for key, value in file_overrides.items():
+            if key in valid_field_names:
+                setattr(config, key, value)
+            else:
+                print(f"Warning: ignoring unknown config key '{key}' in {args.config}", file=sys.stderr)
+
+    # 2. Individual CLI flags -- highest precedence, override both defaults and the config file.
+    overrides = {
+        "symbols": args.symbols,
+        "timeframe_amount": args.timeframe_amount,
+        "timeframe_unit": args.timeframe_unit,
+        "lookback_days": args.lookback_days,
+        "retrain_interval_minutes": args.retrain_interval_minutes,
+        "poll_interval_seconds": args.poll_interval_seconds,
+        "risk_per_trade_pct": args.risk_per_trade_pct,
+        "max_positions": args.max_positions,
+        "max_daily_loss_pct": args.max_daily_loss_pct,
+        "min_prediction_confidence": args.min_prediction_confidence,
+    }
+    for key, value in overrides.items():
+        if value is not None:
+            setattr(config, key, value)
+
+    if args.dry_run:
+        config.dry_run = True
+
+    return config
+
+
+def main() -> None:
+    args = parse_args()
+    config = build_config_from_args(args)
+
+    if args.dump_config:
+        Path(args.dump_config).write_text(json.dumps(asdict(config), indent=2, default=str))
+        print(f"Wrote resolved config to {args.dump_config}")
+        return
+
+    if args.report:
+        analyzer = PerformanceAnalyzer(config)
+        print(analyzer.generate_report())
+        return
+
+    if args.backtest:
+        if not config.api_key or not config.secret_key:
+            raise SystemExit(
+                "Missing Alpaca API credentials for backtest. Set APCA_API_KEY_ID "
+                "and APCA_API_SECRET_KEY."
+            )
+        logger = build_logger(config.log_dir)
+        trading_client = TradingClient(config.api_key, config.secret_key, paper=config.paper)
+        data_feed = AlpacaDataFeed(config, trading_client, logger)
+        backtester = Backtester(
+            config, data_feed, FeatureEngineer(atr_percentile_window=config.atr_percentile_window), logger
+        )
+        results_df = backtester.run()
+        if not results_df.empty:
+            print(results_df.to_string(index=False))
+        return
+
+    bot = TradingBot(config)
+    bot.run()
+
+
+if __name__ == "__main__":
+    main()
