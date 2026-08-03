@@ -43,6 +43,13 @@ A self-contained, single-file algorithmic trading system that:
      live-only overlay -- it has no effect on --backtest, since properly
      backtesting it would require backfilling historical news per bar,
      which is out of scope for a keyword heuristic like this one.
+ 12. Automatically suspends new entries for any symbol whose model has
+     shown no real edge (average walk-forward accuracy near a coin flip)
+     over its last several retrains, resuming on its own if accuracy
+     recovers -- existing positions are still managed normally throughout.
+     Can also use bounded-slippage limit orders instead of market orders
+     for entries (config.entry_order_type = "limit"), capping the worst-
+     case fill price if the quote gaps between decision and execution.
 
 --------------------------------------------------------------------------------
 SAFETY / DISCLAIMER
@@ -257,6 +264,15 @@ class TradingConfig:
     news_sentiment_refresh_minutes: int = 30
     news_sentiment_block_threshold: float = -0.3        # block new BUYs if sentiment <= this
     news_sentiment_short_block_threshold: float = 0.3   # block new SELLs if sentiment >= this
+
+    # --- Model quality gate ----------------------------------------------------
+    model_quality_gate_enabled: bool = True
+    model_quality_history_len: int = 5           # how many recent retrains to average
+    model_quality_min_avg_accuracy: float = 0.51  # below this, suspend NEW entries (existing positions still managed)
+
+    # --- Entry order type (bounded-slippage limit entries) --------------------
+    entry_order_type: str = "market"        # "market" or "limit"
+    entry_limit_buffer_bps: float = 5.0     # for "limit": how far through the reference price to allow
 
     # --- Loop timing -----------------------------------------------------------
     poll_interval_seconds: int = 60
@@ -788,6 +804,7 @@ class MLSignalModel:
         self.last_trained_at: Optional[datetime] = None
         self.last_val_accuracy: float = 0.0
         self.last_val_auc: float = 0.0
+        self.accuracy_history: List[float] = []
 
         Path(config.model_dir).mkdir(parents=True, exist_ok=True)
         self.model_path = Path(config.model_dir) / f"{symbol}_model.joblib"
@@ -811,6 +828,7 @@ class MLSignalModel:
             self.last_trained_at = payload["trained_at"]
             self.last_val_accuracy = payload.get("val_accuracy", 0.0)
             self.last_val_auc = payload.get("val_auc", 0.0)
+            self.accuracy_history = payload.get("accuracy_history", [])
             self.logger.info(
                 f"[{self.symbol}] loaded cached model "
                 f"(trained_at={self.last_trained_at}, val_acc={self.last_val_accuracy:.3f})"
@@ -825,8 +843,26 @@ class MLSignalModel:
             "val_accuracy": self.last_val_accuracy,
             "val_auc": self.last_val_auc,
             "feature_columns": FeatureEngineer.FEATURE_COLUMNS,
+            "accuracy_history": self.accuracy_history,
         }
         joblib.dump(payload, self.model_path)
+
+    def has_edge(self, min_avg_accuracy: float) -> bool:
+        """
+        Returns False when the model has shown, on average, no real
+        directional edge over its last several retrains (average
+        walk-forward accuracy below min_avg_accuracy -- close to a coin
+        flip). This is what lets the bot automatically stop opening new
+        positions in a symbol the model currently has nothing useful to
+        say about, rather than someone having to notice a long run of
+        near-50% accuracy buried in the logs. Requires at least 2 retrains
+        of history before judging, so a single early low reading doesn't
+        suspend trading prematurely.
+        """
+        if len(self.accuracy_history) < 2:
+            return True  # not enough history yet -- give it the benefit of the doubt
+        avg = sum(self.accuracy_history) / len(self.accuracy_history)
+        return avg >= min_avg_accuracy
 
     # ------------------------------------------------------------ training
     def needs_retrain(self) -> bool:
@@ -881,12 +917,16 @@ class MLSignalModel:
         self.last_trained_at = datetime.now(timezone.utc)
         self.last_val_accuracy = val_accuracy
         self.last_val_auc = val_auc
+        self.accuracy_history.append(val_accuracy)
+        self.accuracy_history = self.accuracy_history[-self.config.model_quality_history_len:]
         self._save()
         self._log_feature_importance(final_pipeline)
 
+        avg_recent = sum(self.accuracy_history) / len(self.accuracy_history)
         self.logger.info(
             f"[{self.symbol}] retrained | walk-forward acc={val_accuracy:.3f} "
-            f"auc={val_auc:.3f} | n={len(dataset)}"
+            f"auc={val_auc:.3f} | n={len(dataset)} | recent avg acc={avg_recent:.3f} "
+            f"({len(self.accuracy_history)} retrain(s))"
         )
 
         return val_accuracy >= self.config.min_train_accuracy
@@ -1293,22 +1333,43 @@ class OrderExecutor:
         side: str,
         stop_price: float,
         take_price: float,
+        reference_price: Optional[float] = None,
     ) -> Optional[object]:
+        """
+        `reference_price` (the signal's decision price) is only used when
+        config.entry_order_type == "limit": the entry becomes a marketable
+        limit order priced entry_limit_buffer_bps through the reference
+        price (through, not away from -- e.g. slightly above reference for
+        a BUY), which fills almost as readily as a market order in a
+        liquid name but caps the worst-case entry price if the quote gaps
+        between decision and execution. Falls back to a plain market order
+        if reference_price isn't supplied even when "limit" is configured.
+        """
         if qty <= 0:
             self.logger.info(f"[{symbol}] skip order: computed qty <= 0")
             return None
 
         order_side = OrderSide.BUY if side == "BUY" else OrderSide.SELL
+        use_limit = self.config.entry_order_type == "limit" and reference_price is not None
+        limit_price = None
+        if use_limit:
+            buffer_frac = self.config.entry_limit_buffer_bps / 10_000.0
+            limit_price = round(
+                reference_price * (1 + buffer_frac) if side == "BUY"
+                else reference_price * (1 - buffer_frac),
+                2,
+            )
 
         if self.config.dry_run:
+            fill_desc = f"limit={limit_price}" if use_limit else "market"
             self.logger.info(
-                f"[DRY RUN] Would submit {side} {qty} {symbol} | "
+                f"[DRY RUN] Would submit {side} {qty} {symbol} @ {fill_desc} | "
                 f"stop={stop_price} take={take_price}"
             )
             return None
 
         try:
-            request = MarketOrderRequest(
+            common_kwargs = dict(
                 symbol=symbol,
                 qty=qty,
                 side=order_side,
@@ -1317,9 +1378,15 @@ class OrderExecutor:
                 stop_loss=StopLossRequest(stop_price=stop_price),
                 take_profit=TakeProfitRequest(limit_price=take_price),
             )
+            if use_limit:
+                request = LimitOrderRequest(limit_price=limit_price, **common_kwargs)
+            else:
+                request = MarketOrderRequest(**common_kwargs)
+
             order = self.client.submit_order(request)
+            fill_desc = f"limit={limit_price}" if use_limit else "market"
             self.logger.info(
-                f"Submitted {side} bracket order: {qty} {symbol} @ market | "
+                f"Submitted {side} bracket order: {qty} {symbol} @ {fill_desc} | "
                 f"stop={stop_price} take={take_price} | order_id={order.id}"
             )
             return order
@@ -1960,6 +2027,9 @@ class TradingBot:
         # symbol -> (last_checked_at, sentiment_score)
         self._news_sentiment_cache: Dict[str, Tuple[datetime, float]] = {}
 
+        # symbol -> last-known has_edge() result, so we log only on transitions
+        self._edge_state_cache: Dict[str, bool] = {}
+
         # cached adaptive sizing multiplier, refreshed on its own schedule
         self._performance_multiplier: float = 1.0
         self._performance_multiplier_checked_at: Optional[datetime] = None
@@ -2034,6 +2104,33 @@ class TradingBot:
         score = self.news_sentiment_analyzer.score_articles(articles)
         self._news_sentiment_cache[symbol] = (now, score)
         return score
+
+    def _model_has_edge(self, symbol: str, model: MLSignalModel) -> bool:
+        """
+        Wraps model.has_edge() with state-transition logging, so a symbol
+        getting suspended (or recovering) is a clear, one-time WARNING/INFO
+        line rather than something you'd only notice by averaging accuracy
+        numbers out of a wall of per-cycle log lines yourself.
+        """
+        if not self.config.model_quality_gate_enabled:
+            return True
+
+        currently_has_edge = model.has_edge(self.config.model_quality_min_avg_accuracy)
+        previously_has_edge = self._edge_state_cache.get(symbol, True)
+
+        if previously_has_edge and not currently_has_edge:
+            avg = sum(model.accuracy_history) / len(model.accuracy_history)
+            self.logger.warning(
+                f"[{symbol}] model quality gate: suspending new entries -- recent avg "
+                f"walk-forward accuracy {avg:.3f} is below the {self.config.model_quality_min_avg_accuracy:.3f} "
+                f"floor over its last {len(model.accuracy_history)} retrain(s). Existing positions, if "
+                f"any, are still managed normally. Will resume automatically if accuracy recovers."
+            )
+        elif not previously_has_edge and currently_has_edge:
+            self.logger.info(f"[{symbol}] model quality gate: accuracy recovered, resuming new entries")
+
+        self._edge_state_cache[symbol] = currently_has_edge
+        return currently_has_edge
 
     def _get_performance_multiplier(self) -> float:
         """Cached adaptive-sizing multiplier, refreshed on its own schedule
@@ -2146,6 +2243,9 @@ class TradingBot:
         if len(open_positions) >= self.config.max_positions:
             return
 
+        if not self._model_has_edge(symbol, model):
+            return
+
         if signal.action == "FLAT":
             return
 
@@ -2183,7 +2283,8 @@ class TradingBot:
         can_split = self.config.enable_partial_scale_out and qty >= 2
         if not can_split:
             order = self.executor.submit_bracket_order(
-                symbol, qty, signal.action, stop_price, full_take_price
+                symbol, qty, signal.action, stop_price, full_take_price,
+                reference_price=signal.price,
             )
             if order is not None or self.config.dry_run:
                 self.journal.log_trade(signal, qty, stop_price, full_take_price)
@@ -2201,13 +2302,15 @@ class TradingBot:
         )
 
         order1 = self.executor.submit_bracket_order(
-            symbol, qty_first, signal.action, stop_price, near_take_price
+            symbol, qty_first, signal.action, stop_price, near_take_price,
+            reference_price=signal.price,
         )
         if order1 is not None or self.config.dry_run:
             self.journal.log_trade(signal, qty_first, stop_price, near_take_price)
 
         order2 = self.executor.submit_bracket_order(
-            symbol, qty_second, signal.action, stop_price, full_take_price
+            symbol, qty_second, signal.action, stop_price, full_take_price,
+            reference_price=signal.price,
         )
         if order2 is not None or self.config.dry_run:
             self.journal.log_trade(signal, qty_second, stop_price, full_take_price)
