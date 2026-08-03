@@ -36,6 +36,13 @@ A self-contained, single-file algorithmic trading system that:
      target) instead of all-or-nothing exits, writes a heartbeat file for
      external monitoring, and supports a JSON config file (--config) plus
      --dump-config for generating one
+ 11. Pulls recent news headlines via Alpaca's own News API (no separate
+     signup) and scores them with a lightweight keyword-based sentiment
+     heuristic, blocking new entries that would fight a wave of clearly
+     bad (or clearly good, for shorts) recent headlines. This is a
+     live-only overlay -- it has no effect on --backtest, since properly
+     backtesting it would require backfilling historical news per bar,
+     which is out of scope for a keyword heuristic like this one.
 
 --------------------------------------------------------------------------------
 SAFETY / DISCLAIMER
@@ -81,8 +88,9 @@ ARCHITECTURE
 TradingConfig       -- all tunable parameters in one place
 AlpacaDataFeed       -- historical bar + quote + clock + daily-trend access
 FeatureEngineer      -- turns raw OHLCV into a model-ready feature frame
+NewsSentimentAnalyzer -- keyword-based sentiment scoring for live news
 MLSignalModel        -- trains/retrains/predicts with a soft-voting ensemble
-SignalGenerator      -- ML + intraday trend + daily trend confirmation
+SignalGenerator      -- ML + intraday/daily trend + volatility + news gates
 RiskManager          -- sizing, stop/take, persisted daily loss halt,
                         correlation-group exposure caps
 OrderExecutor        -- submits/cancels orders, bracket orders, stop replaces
@@ -158,8 +166,7 @@ try:
         OrderClass,
         QueryOrderStatus,
     )
-    from alpaca.data.historical import StockHistoricalDataClient
-    from alpaca.data.historical.news import NewsClient
+    from alpaca.data.historical import StockHistoricalDataClient, NewsClient
     from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest, NewsRequest
     from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 except ImportError as exc:  # pragma: no cover
@@ -187,11 +194,11 @@ class TradingConfig:
     symbols: List[str] = field(default_factory=lambda: ["AAPL", "MSFT", "SPY", "QQQ", "NVDA"])
     timeframe_amount: int = 15
     timeframe_unit: str = "Minute"       # "Minute", "Hour", "Day"
-    lookback_days: int = 120              # history pulled for training/features
+    lookback_days: int = 60              # history pulled for training/features
     min_bars_required: int = 250         # minimum bars before we'll train/trade a symbol
 
     # --- Model / retraining -------------------------------------------------
-    prediction_horizon_bars: int = 8     # predict direction N bars ahead
+    prediction_horizon_bars: int = 4     # predict direction N bars ahead
     retrain_interval_minutes: int = 120  # how often to refit the model
     min_train_accuracy: float = 0.50     # sanity floor; below this we stay flat
     min_prediction_confidence: float = 0.58  # min predicted P(up) / P(down) to act
@@ -1038,7 +1045,6 @@ class SignalGenerator:
         )
 
         if proba_up >= self.config.min_prediction_confidence and trend_up:
-
             if daily_blocks_long:
                 return Signal(
                     symbol, "FLAT", confidence, price, atr,
@@ -2108,7 +2114,10 @@ class TradingBot:
             return
 
         daily_trend = self._get_daily_trend(symbol) if self.config.require_daily_trend_confirmation else None
-        signal = self.signal_generator.generate(symbol, model, latest, daily_trend=daily_trend)
+        news_sentiment = self._get_news_sentiment(symbol) if self.config.news_sentiment_enabled else None
+        signal = self.signal_generator.generate(
+            symbol, model, latest, daily_trend=daily_trend, news_sentiment=news_sentiment
+        )
         already_in_position = symbol in open_positions
 
         self.logger.info(
