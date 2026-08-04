@@ -53,6 +53,18 @@ A self-contained, single-file algorithmic trading system that:
  13. Tracks real execution slippage (--report now shows decision price vs.
      actual fill price, joined by order_id) and can print each symbol's
      model-quality-gate status without digging through logs (--model-status).
+ 14. FIXED a real bug found from live paper-trading logs: the original
+     scale-out implementation submitted two independent bracket orders per
+     entry, and Alpaca's OCO protection doesn't recognize that two separate
+     brackets jointly protect one combined position -- it silently
+     cancelled both take-profit legs while leaving both stop-loss legs
+     resting, so a scaled-out position could only ever exit at a loss.
+     Scale-out is now managed by ScaleOutManager: exactly one bracket
+     order is ever open per symbol at any moment; a partial profit-take
+     cancels it, submits a plain partial-close market order, then
+     immediately re-establishes a single fresh bracket on the remainder.
+     Defaults to OFF (config.enable_partial_scale_out) until you've
+     watched the new mechanism work correctly for yourself.
 
 --------------------------------------------------------------------------------
 SAFETY / DISCLAIMER
@@ -255,7 +267,16 @@ class TradingConfig:
     atr_percentile_max: float = 0.95     # skip trading above this percentile (too chaotic: gap/slippage risk)
 
     # --- Partial profit taking (scale-out) ------------------------------------
-    enable_partial_scale_out: bool = True
+    # Defaults to OFF. An earlier version of this feature submitted two
+    # independent bracket orders per entry, which caused Alpaca to silently
+    # cancel both take-profit legs while leaving both stop-loss legs
+    # resting -- a real bug that cost real (paper) money. It's been
+    # rewritten (see ScaleOutManager) to never have more than one bracket
+    # order open per symbol at a time, which eliminates that failure mode.
+    # The new mechanism is unit-tested but has not yet been run against a
+    # live Alpaca account, so this stays opt-in until you've watched it
+    # work correctly in --dry-run and then live for a few trades.
+    enable_partial_scale_out: bool = False
     scale_out_first_target_atr_mult: float = 1.5   # closer target for the first lot
     scale_out_fraction: float = 0.5                # fraction of qty exited at the first target
 
@@ -1419,6 +1440,60 @@ class OrderExecutor:
         except Exception as exc:
             self.logger.error(f"Failed to close all positions: {exc}")
 
+    def cancel_orders_for_symbol(self, symbol: str) -> bool:
+        """
+        Cancels every open order for `symbol`. Used before re-protecting a
+        position with a fresh bracket order (see ScaleOutManager) so there
+        is never more than one stop-loss + one take-profit resting at once
+        for a given symbol. Deliberately NOT wrapped in call_with_retry --
+        same order-mutation safety reasoning as elsewhere: a failed cancel
+        here means we abort the scale-out step this cycle and try again
+        next cycle, rather than risk a duplicate/partial cancellation from
+        retrying a request that may have actually succeeded.
+        """
+        if self.config.dry_run:
+            self.logger.info(f"[DRY RUN] Would cancel all open orders for {symbol}")
+            return True
+        try:
+            req = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])
+            orders = self.client.get_orders(req)
+            for order in orders:
+                self.client.cancel_order_by_id(order.id)
+            return True
+        except Exception as exc:
+            self.logger.error(f"[{symbol}] failed to cancel open orders: {exc}")
+            return False
+
+    def close_partial_position(self, symbol: str, qty: int, position_side: str) -> Optional[object]:
+        """
+        Submits a plain (non-bracket) market order to reduce an existing
+        position by `qty` shares -- `position_side` is the side of the
+        POSITION being reduced ("BUY" for a long, "SELL" for a short), so
+        the actual order submitted is the opposite side. This is deliberately
+        a bare market order, not another bracket: submitting a second
+        bracket for a partial exit is exactly what caused the overlapping-
+        protection bug this method exists to avoid (see ScaleOutManager).
+        Caller is responsible for cancelling any existing protective orders
+        first and re-establishing a single fresh bracket for the remainder.
+        """
+        if qty <= 0:
+            return None
+        closing_side = OrderSide.SELL if position_side == "BUY" else OrderSide.BUY
+
+        if self.config.dry_run:
+            self.logger.info(f"[DRY RUN] Would partially close {symbol}: {closing_side} {qty} @ market")
+            return None
+        try:
+            request = MarketOrderRequest(
+                symbol=symbol, qty=qty, side=closing_side, time_in_force=TimeInForce.DAY,
+            )
+            order = self.client.submit_order(request)
+            self.logger.info(f"[{symbol}] partial close submitted: {closing_side} {qty} @ market | order_id={order.id}")
+            return order
+        except Exception as exc:
+            self.logger.error(f"[{symbol}] partial close order failed: {exc}")
+            return None
+
     def replace_stop_order(self, order_id: str, new_stop_price: float) -> bool:
         """
         Updates a resting stop order's trigger price in place (used by
@@ -1472,6 +1547,12 @@ class TrailingStopManager:
         """Symbols currently being trailed, for cleanup by the caller."""
         return list(self._tracked_stops.keys())
 
+    def current_stop(self, symbol: str) -> Optional[float]:
+        """The tightest stop level we've ratcheted to for this symbol, if
+        any -- used by ScaleOutManager so re-establishing protection after
+        a partial close never loosens back to the original stop."""
+        return self._tracked_stops.get(symbol)
+
     def update(self, symbol: str, position: object, current_price: float, atr: float) -> None:
         if not self.config.trailing_stop or atr <= 0 or np.isnan(atr):
             return
@@ -1505,6 +1586,154 @@ class TrailingStopManager:
                 f"[{symbol}] trailing stop tightened to {rounded_candidate} "
                 f"({len(orders)} leg(s) updated)"
             )
+
+
+# ==============================================================================
+# 8.7 SCALE-OUT MANAGEMENT
+# ==============================================================================
+
+class ScaleOutManager:
+    """
+    Manages partial profit-taking WITHOUT ever having more than one
+    bracket order open per symbol at a time. Registers a scale-out plan
+    when a position is opened (stop, near-target, full-target, total
+    qty), then on each poll cycle checks whether price has reached the
+    near target -- if so, cancels the single resting bracket, submits a
+    plain market order to partially close the position, and immediately
+    re-establishes a single fresh bracket order protecting the remaining
+    shares at the full stop/take levels.
+
+    This exists specifically to avoid a bug in an earlier version of this
+    script, which submitted two independent bracket orders per entry to
+    achieve scale-out. Alpaca's OCO (one-cancels-other) protection only
+    applies within a single bracket -- across two separate brackets on
+    the same symbol, it does not recognize that they jointly protect one
+    combined position. In practice this caused both take-profit legs to
+    get silently cancelled while both stop-loss legs survived, leaving
+    the position able to exit only at a loss. Never having more than one
+    bracket open per symbol, at any point in time, eliminates that
+    failure mode entirely -- there is nothing for Alpaca to misjudge
+    across, because there is only ever one bracket to begin with.
+    """
+
+    def __init__(self, config: TradingConfig, executor: OrderExecutor, logger: logging.Logger):
+        self.config = config
+        self.executor = executor
+        self.logger = logger
+        self._plans: Dict[str, Dict] = {}  # symbol -> plan dict
+
+    def register(
+        self,
+        symbol: str,
+        side: str,
+        total_qty: int,
+        stop_price: float,
+        near_take_price: float,
+        full_take_price: float,
+    ) -> None:
+        qty_first = max(1, int(total_qty * self.config.scale_out_fraction))
+        qty_remaining = total_qty - qty_first
+        if qty_remaining < 1:
+            qty_first = total_qty - 1
+            qty_remaining = 1
+
+        self._plans[symbol] = {
+            "side": side,
+            "stop_price": stop_price,
+            "near_take_price": near_take_price,
+            "full_take_price": full_take_price,
+            "qty_to_take_at_near_target": qty_first,
+            "qty_remaining_after": qty_remaining,
+            "scaled": False,
+            "needs_reprotection": False,
+        }
+
+    def reset(self, symbol: str) -> None:
+        self._plans.pop(symbol, None)
+
+    def tracked_symbols(self) -> List[str]:
+        return list(self._plans.keys())
+
+    def check_and_execute(
+        self, symbol: str, current_price: float, effective_stop_price: Optional[float] = None
+    ) -> None:
+        plan = self._plans.get(symbol)
+        if plan is None or plan["scaled"]:
+            return
+
+        side = plan["side"]
+
+        # If a prior cycle partially closed the position but then failed to
+        # re-establish protection on the remainder, fixing that takes
+        # priority over everything else -- an unprotected position is the
+        # one state this manager must never leave sitting for long.
+        if plan["needs_reprotection"]:
+            stop_to_use = effective_stop_price or plan["stop_price"]
+            new_bracket = self.executor.submit_bracket_order(
+                symbol, plan["qty_remaining_after"], side, stop_to_use, plan["full_take_price"],
+                reference_price=current_price,
+            )
+            if new_bracket is not None or self.config.dry_run:
+                plan["needs_reprotection"] = False
+                plan["scaled"] = True
+                self.logger.info(f"[{symbol}] re-protection retry succeeded after a prior scale-out failure")
+            else:
+                self.logger.error(
+                    f"[{symbol}] CRITICAL: still unable to re-protect the remaining position after "
+                    f"scale-out. Will retry next cycle -- consider checking this position manually."
+                )
+            return
+
+        near_take = plan["near_take_price"]
+        reached = current_price >= near_take if side == "BUY" else current_price <= near_take
+        if not reached:
+            return
+
+        self.logger.info(
+            f"[{symbol}] scale-out target reached (price={current_price}, near_take={near_take}) "
+            f"-- taking partial profit on {plan['qty_to_take_at_near_target']} share(s)"
+        )
+
+        if not self.executor.cancel_orders_for_symbol(symbol):
+            self.logger.warning(f"[{symbol}] scale-out deferred this cycle: failed to cancel existing orders")
+            return
+
+        partial_order = self.executor.close_partial_position(
+            symbol, plan["qty_to_take_at_near_target"], position_side=side
+        )
+        if partial_order is None and not self.config.dry_run:
+            self.logger.error(
+                f"[{symbol}] partial close failed after cancelling protective orders -- "
+                f"re-establishing full protection on the original quantity immediately"
+            )
+            fallback_qty = plan["qty_to_take_at_near_target"] + plan["qty_remaining_after"]
+            self.executor.submit_bracket_order(
+                symbol, fallback_qty, side,
+                effective_stop_price or plan["stop_price"], plan["full_take_price"],
+                reference_price=current_price,
+            )
+            return  # not marked scaled -- will simply retry the whole sequence next cycle
+
+        stop_to_use = effective_stop_price or plan["stop_price"]
+        new_bracket = self.executor.submit_bracket_order(
+            symbol, plan["qty_remaining_after"], side, stop_to_use, plan["full_take_price"],
+            reference_price=current_price,
+        )
+        if new_bracket is None and not self.config.dry_run:
+            self.logger.error(
+                f"[{symbol}] CRITICAL: partial close succeeded but re-establishing protection on the "
+                f"remaining {plan['qty_remaining_after']} share(s) failed -- position may be UNPROTECTED "
+                f"right now. Will retry next cycle."
+            )
+            plan["needs_reprotection"] = True
+            return
+
+        plan["scaled"] = True
+        self.logger.info(
+            f"[{symbol}] scale-out complete: took profit on partial qty, remaining "
+            f"{plan['qty_remaining_after']} share(s) re-protected with a fresh bracket "
+            f"(stop={stop_to_use}, take={plan['full_take_price']})"
+        )
 
 
 # ==============================================================================
@@ -2126,6 +2355,7 @@ class TradingBot:
         }
         self.fill_tracker = FillTracker(config, self.executor, self.logger)
         self.trailing_stop_manager = TrailingStopManager(config, self.executor, self.logger)
+        self.scale_out_manager = ScaleOutManager(config, self.executor, self.logger)
         self.performance_analyzer = PerformanceAnalyzer(config, self.logger)
         self.news_sentiment_analyzer = NewsSentimentAnalyzer()
 
@@ -2342,7 +2572,11 @@ class TradingBot:
                 self.logger.info(f"[{symbol}] model flipped against open position, closing")
                 self.executor.close_position(symbol)
                 self.trailing_stop_manager.reset(symbol)
+                self.scale_out_manager.reset(symbol)
             else:
+                self.scale_out_manager.check_and_execute(
+                    symbol, signal.price, effective_stop_price=self.trailing_stop_manager.current_stop(symbol)
+                )
                 self.trailing_stop_manager.update(symbol, position, signal.price, signal.atr)
             return  # bracket order already manages stop/take on the resting order
 
@@ -2378,56 +2612,45 @@ class TradingBot:
 
     def _submit_entry(self, symbol: str, signal: Signal, qty: int) -> None:
         """
-        Submits the entry order(s) for a new position. When partial
-        scale-out is enabled and qty is large enough to split meaningfully,
-        this submits two smaller bracket orders sharing the same stop but
-        with two different take-profit targets -- a closer one for the
-        first lot (locks in partial profit early) and the full configured
-        target for the second lot (lets a genuine trend keep running).
-        Falls back to a single bracket order for small quantities or when
-        scale-out is disabled.
+        Submits the entry order for a new position -- ALWAYS as exactly one
+        bracket order for the full quantity, at the full stop-loss and
+        full take-profit levels. This is intentional: an earlier version
+        of this method submitted two separate, smaller bracket orders to
+        achieve partial scale-out, which turned out to be a real bug --
+        Alpaca's bracket OCO protection only applies within a single
+        bracket, not across two independent ones on the same symbol, and
+        submitting two caused it to reject/cancel the take-profit legs
+        while leaving both stop-loss legs resting, silently leaving the
+        position able to exit only at a loss. See ScaleOutManager for how
+        partial scale-out is now handled instead -- as a managed partial
+        close of an already-fully-protected single-bracket position,
+        never as multiple simultaneous brackets.
         """
         stop_price, full_take_price = self.risk_manager.stop_take_levels(
             signal.price, signal.atr, signal.action
         )
 
-        can_split = self.config.enable_partial_scale_out and qty >= 2
-        if not can_split:
-            order = self.executor.submit_bracket_order(
-                symbol, qty, signal.action, stop_price, full_take_price,
-                reference_price=signal.price,
+        order = self.executor.submit_bracket_order(
+            symbol, qty, signal.action, stop_price, full_take_price,
+            reference_price=signal.price,
+        )
+        if order is not None or self.config.dry_run:
+            order_id = str(order.id) if order is not None else ""
+            self.journal.log_trade(signal, qty, stop_price, full_take_price, order_id=order_id)
+
+        if self.config.enable_partial_scale_out and qty >= 2:
+            _, near_take_price = self.risk_manager.stop_take_levels(
+                signal.price, signal.atr, signal.action,
+                take_mult=self.config.scale_out_first_target_atr_mult,
             )
-            if order is not None or self.config.dry_run:
-                order_id = str(order.id) if order is not None else ""
-                self.journal.log_trade(signal, qty, stop_price, full_take_price, order_id=order_id)
-            return
-
-        qty_first = max(1, int(qty * self.config.scale_out_fraction))
-        qty_second = qty - qty_first
-        if qty_second < 1:
-            qty_first = qty - 1
-            qty_second = 1
-
-        _, near_take_price = self.risk_manager.stop_take_levels(
-            signal.price, signal.atr, signal.action,
-            take_mult=self.config.scale_out_first_target_atr_mult,
-        )
-
-        order1 = self.executor.submit_bracket_order(
-            symbol, qty_first, signal.action, stop_price, near_take_price,
-            reference_price=signal.price,
-        )
-        if order1 is not None or self.config.dry_run:
-            order1_id = str(order1.id) if order1 is not None else ""
-            self.journal.log_trade(signal, qty_first, stop_price, near_take_price, order_id=order1_id)
-
-        order2 = self.executor.submit_bracket_order(
-            symbol, qty_second, signal.action, stop_price, full_take_price,
-            reference_price=signal.price,
-        )
-        if order2 is not None or self.config.dry_run:
-            order2_id = str(order2.id) if order2 is not None else ""
-            self.journal.log_trade(signal, qty_second, stop_price, full_take_price, order_id=order2_id)
+            self.scale_out_manager.register(
+                symbol=symbol,
+                side=signal.action,
+                total_qty=qty,
+                stop_price=stop_price,
+                near_take_price=near_take_price,
+                full_take_price=full_take_price,
+            )
 
     def _flatten_for_close(self) -> None:
         self.logger.info("Approaching market close: flattening all positions.")
@@ -2489,12 +2712,15 @@ class TradingBot:
                 open_positions = self.executor.get_open_positions()
 
                 # A position may have closed on its own (stop/take fill) since
-                # the last cycle -- clear its trailing-stop tracking so a new
-                # trade in the same symbol starts fresh instead of being
-                # compared against a stale prior stop level.
+                # the last cycle -- clear its trailing-stop and scale-out
+                # tracking so a new trade in the same symbol starts fresh
+                # instead of being compared against stale prior state.
                 for tracked_symbol in self.trailing_stop_manager.tracked_symbols():
                     if tracked_symbol not in open_positions:
                         self.trailing_stop_manager.reset(tracked_symbol)
+                for tracked_symbol in self.scale_out_manager.tracked_symbols():
+                    if tracked_symbol not in open_positions:
+                        self.scale_out_manager.reset(tracked_symbol)
 
                 if (
                     minutes_to_close is not None
