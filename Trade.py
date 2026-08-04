@@ -50,6 +50,9 @@ A self-contained, single-file algorithmic trading system that:
      Can also use bounded-slippage limit orders instead of market orders
      for entries (config.entry_order_type = "limit"), capping the worst-
      case fill price if the quote gaps between decision and execution.
+ 13. Tracks real execution slippage (--report now shows decision price vs.
+     actual fill price, joined by order_id) and can print each symbol's
+     model-quality-gate status without digging through logs (--model-status).
 
 --------------------------------------------------------------------------------
 SAFETY / DISCLAIMER
@@ -198,7 +201,7 @@ class TradingConfig:
     paper: bool = True  # NEVER set False in this script. See TradingBot._safety_check.
 
     # --- Universe & bar settings ------------------------------------------
-    symbols: List[str] = field(default_factory=lambda: ["AAPL", "MSFT", "SPY", "QQQ", "NVDA"])
+    symbols: List[str] = field(default_factory=lambda: ["AAPL", "MSFT", "SPY", "QQQ", "NVDA","AMZN","META","TSLA","GRMN","CIBR"])
     timeframe_amount: int = 15
     timeframe_unit: str = "Minute"       # "Minute", "Hour", "Day"
     lookback_days: int = 60              # history pulled for training/features
@@ -1518,20 +1521,63 @@ class TradeJournal:
         self._ensure_headers()
 
     def _ensure_headers(self) -> None:
+        expected_trade_columns = [
+            "timestamp", "symbol", "action", "qty", "price",
+            "stop_price", "take_price", "confidence", "reason", "order_id",
+        ]
         if not self.trade_log_path.exists():
-            pd.DataFrame(
-                columns=[
-                    "timestamp", "symbol", "action", "qty", "price",
-                    "stop_price", "take_price", "confidence", "reason",
-                ]
-            ).to_csv(self.trade_log_path, index=False)
+            pd.DataFrame(columns=expected_trade_columns).to_csv(self.trade_log_path, index=False)
+        else:
+            self._migrate_if_schema_changed(self.trade_log_path, expected_trade_columns)
 
         if not self.equity_curve_path.exists():
             pd.DataFrame(columns=["timestamp", "equity", "cash", "positions_count"]).to_csv(
                 self.equity_curve_path, index=False
             )
 
-    def log_trade(self, signal: Signal, qty: int, stop_price: float, take_price: float) -> None:
+    def _migrate_if_schema_changed(self, path: Path, expected_columns: List[str]) -> None:
+        """
+        If a CSV log from an earlier version of the script has a different
+        column set than the current code expects (e.g. this round added
+        order_id), archive the old file and start a fresh one rather than
+        appending mismatched rows, which pandas would otherwise write
+        silently misaligned.
+        """
+        try:
+            existing_columns = list(pd.read_csv(path, nrows=0).columns)
+        except Exception as exc:
+            self.logger.warning(f"Could not read existing log header at {path}: {exc}")
+            return
+
+        if existing_columns == expected_columns:
+            return
+
+        backup_path = path.with_name(f"{path.stem}_pre_migration_{int(time.time())}{path.suffix}")
+        try:
+            path.rename(backup_path)
+            self.logger.warning(
+                f"{path.name} had an older column schema ({existing_columns}) than the "
+                f"current code expects ({expected_columns}). Archived the old file to "
+                f"{backup_path.name} and started a fresh one so new rows don't misalign."
+            )
+        except Exception as exc:
+            self.logger.warning(f"Failed to archive outdated log {path}: {exc}")
+            return
+
+        pd.DataFrame(columns=expected_columns).to_csv(path, index=False)
+
+    def log_trade(
+        self, signal: Signal, qty: int, stop_price: float, take_price: float,
+        order_id: str = "",
+    ) -> None:
+        """
+        `order_id`, when available, is what lets PerformanceAnalyzer join
+        this decision-time row against the actual fill recorded in
+        fills.csv -- comparing the price the model decided at (`price`
+        here) against what was actually paid (filled_avg_price there) is
+        the real measure of execution slippage. Left blank for dry-run
+        entries, where no real order exists to join against.
+        """
         row = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "symbol": signal.symbol,
@@ -1542,6 +1588,7 @@ class TradeJournal:
             "take_price": take_price,
             "confidence": round(signal.confidence, 4),
             "reason": signal.reason,
+            "order_id": order_id,
         }
         pd.DataFrame([row]).to_csv(self.trade_log_path, mode="a", header=False, index=False)
 
@@ -1650,12 +1697,18 @@ class PerformanceAnalyzer:
         self.logger = logger or logging.getLogger("alpaca_ml_bot")
         self.equity_curve_path = Path(config.log_dir) / config.equity_curve_csv
         self.fills_path = Path(config.log_dir) / config.fills_csv
+        self.trade_log_path = Path(config.log_dir) / config.trade_log_csv
 
     def _load_equity_curve(self) -> pd.DataFrame:
         if not self.equity_curve_path.exists():
             return pd.DataFrame()
         df = pd.read_csv(self.equity_curve_path, parse_dates=["timestamp"])
         return df.dropna(subset=["equity"]).sort_values("timestamp")
+
+    def _load_trade_log(self) -> pd.DataFrame:
+        if not self.trade_log_path.exists():
+            return pd.DataFrame()
+        return pd.read_csv(self.trade_log_path, parse_dates=["timestamp"])
 
     def _load_fills(self) -> pd.DataFrame:
         if not self.fills_path.exists():
@@ -1747,6 +1800,49 @@ class PerformanceAnalyzer:
         multiplier = 1.0 + (profit_factor - 1.5) * 0.5
         return float(np.clip(multiplier, min_multiplier, max_multiplier))
 
+    def slippage_report(self) -> pd.DataFrame:
+        """
+        Joins trade_log.csv (the price the model decided at) against
+        fills.csv (the price Alpaca actually filled at, matched by
+        order_id) to measure real execution slippage per trade -- the
+        trade log alone only shows what the bot intended, not what it
+        actually paid. Returns an empty DataFrame if there's not yet
+        enough data to join (e.g. all entries were --dry-run, which never
+        produces a real order_id to match against).
+
+        slippage_bps is signed so that positive ALWAYS means "cost you
+        money": paying more than the decision price on a BUY, or
+        receiving less than the decision price on a SELL, both come out
+        positive.
+        """
+        trades = self._load_trade_log()
+        fills = self._load_fills()
+        if trades.empty or fills.empty:
+            return pd.DataFrame()
+
+        trades = trades[trades["order_id"].notna() & (trades["order_id"].astype(str) != "")]
+        if trades.empty:
+            return pd.DataFrame()
+
+        merged = trades.merge(
+            fills[["order_id", "filled_avg_price"]], on="order_id", how="inner"
+        )
+        if merged.empty:
+            return pd.DataFrame()
+
+        def _signed_slippage_bps(row) -> float:
+            decision_price = row["price"]
+            fill_price = row["filled_avg_price"]
+            if not decision_price or decision_price <= 0:
+                return float("nan")
+            raw_bps = (fill_price - decision_price) / decision_price * 10_000
+            return raw_bps if row["action"] == "BUY" else -raw_bps
+
+        merged["slippage_bps"] = merged.apply(_signed_slippage_bps, axis=1)
+        return merged[
+            ["timestamp", "symbol", "action", "qty", "price", "filled_avg_price", "slippage_bps", "order_id"]
+        ].dropna(subset=["slippage_bps"])
+
     def generate_report(self, periods_per_year: float = 252 * 26) -> str:
         """
         `periods_per_year` defaults to a rough estimate for 15-minute bars
@@ -1801,6 +1897,21 @@ class PerformanceAnalyzer:
                         f"  {symbol:<6} trades={int(row['count']):<4} "
                         f"total=${row['sum']:>9.2f}  avg=${row['mean']:>7.2f}"
                     )
+
+        slip_df = self.slippage_report()
+        if slip_df.empty:
+            lines.append(
+                "\nNo slippage data yet -- needs live (non-dry-run) fills to compare "
+                "decision price against actual fill price."
+            )
+        else:
+            avg_bps = slip_df["slippage_bps"].mean()
+            total_notional = (slip_df["qty"] * slip_df["price"]).sum()
+            est_cost = (slip_df["slippage_bps"] / 10_000 * slip_df["qty"] * slip_df["price"]).sum()
+            lines.append("")
+            lines.append(f"Slippage (decision price vs. actual fill, {len(slip_df)} order(s)):")
+            lines.append(f"  Avg slippage:      {avg_bps:+.1f} bps (positive = cost you money)")
+            lines.append(f"  Est. total cost:   ${est_cost:+,.2f} on ${total_notional:,.0f} traded notional")
 
         lines.append("=" * 60)
         return "\n".join(lines)
@@ -2287,7 +2398,8 @@ class TradingBot:
                 reference_price=signal.price,
             )
             if order is not None or self.config.dry_run:
-                self.journal.log_trade(signal, qty, stop_price, full_take_price)
+                order_id = str(order.id) if order is not None else ""
+                self.journal.log_trade(signal, qty, stop_price, full_take_price, order_id=order_id)
             return
 
         qty_first = max(1, int(qty * self.config.scale_out_fraction))
@@ -2306,14 +2418,16 @@ class TradingBot:
             reference_price=signal.price,
         )
         if order1 is not None or self.config.dry_run:
-            self.journal.log_trade(signal, qty_first, stop_price, near_take_price)
+            order1_id = str(order1.id) if order1 is not None else ""
+            self.journal.log_trade(signal, qty_first, stop_price, near_take_price, order_id=order1_id)
 
         order2 = self.executor.submit_bracket_order(
             symbol, qty_second, signal.action, stop_price, full_take_price,
             reference_price=signal.price,
         )
         if order2 is not None or self.config.dry_run:
-            self.journal.log_trade(signal, qty_second, stop_price, full_take_price)
+            order2_id = str(order2.id) if order2 is not None else ""
+            self.journal.log_trade(signal, qty_second, stop_price, full_take_price, order_id=order2_id)
 
     def _flatten_for_close(self) -> None:
         self.logger.info("Approaching market close: flattening all positions.")
@@ -2466,6 +2580,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print a performance report from existing logs and exit (no trading, no API calls).",
     )
+    parser.add_argument(
+        "--model-status",
+        action="store_true",
+        help=(
+            "Print each symbol's cached model status (last trained, recent accuracy "
+            "history, and whether the model quality gate currently has it suspended) "
+            "and exit. Reads local model cache files only -- no API calls needed."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -2518,6 +2641,34 @@ def build_config_from_args(args: argparse.Namespace) -> TradingConfig:
     return config
 
 
+def print_model_status(config: TradingConfig, logger: logging.Logger) -> None:
+    """Reads each configured symbol's cached model from disk and prints its
+    training status and model-quality-gate state. No API calls -- local
+    cache files only, so this works even without network access."""
+    print("=" * 60)
+    print("MODEL STATUS")
+    print("=" * 60)
+    for symbol in config.symbols:
+        model = MLSignalModel(symbol, config, logger)
+        if model.pipeline is None:
+            print(f"{symbol:<6} -- no cached model found (never trained, or cache was invalidated)")
+            continue
+
+        has_edge = model.has_edge(config.model_quality_min_avg_accuracy)
+        gate_status = "ACTIVE" if has_edge else "SUSPENDED (new entries blocked)"
+        history_str = ", ".join(f"{a:.3f}" for a in model.accuracy_history) or "n/a"
+        avg_str = (
+            f"{sum(model.accuracy_history) / len(model.accuracy_history):.3f}"
+            if model.accuracy_history else "n/a"
+        )
+        print(
+            f"{symbol:<6} trained_at={model.last_trained_at} | "
+            f"last_acc={model.last_val_accuracy:.3f} | recent_avg={avg_str} | "
+            f"history=[{history_str}] | gate={gate_status}"
+        )
+    print("=" * 60)
+
+
 def main() -> None:
     args = parse_args()
     config = build_config_from_args(args)
@@ -2530,6 +2681,11 @@ def main() -> None:
     if args.report:
         analyzer = PerformanceAnalyzer(config)
         print(analyzer.generate_report())
+        return
+
+    if args.model_status:
+        logger = build_logger(config.log_dir)
+        print_model_status(config, logger)
         return
 
     if args.backtest:
