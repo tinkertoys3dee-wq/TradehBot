@@ -1,1 +1,1 @@
-worker: python Trade.py
+worker: python Trade.py --config railway_config.json
