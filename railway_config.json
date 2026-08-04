@@ -1,0 +1,5 @@
+{
+  "model_dir": "/app/data/models",
+  "log_dir": "/app/data/logs",
+  "state_dir": "/app/data/state"
+}
