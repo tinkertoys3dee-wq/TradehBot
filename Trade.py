@@ -317,6 +317,16 @@ class TradingConfig:
     confidence_sizing_max_multiplier: float = 1.5    # multiplier at/above confidence_sizing_full_scale_at
     confidence_sizing_full_scale_at: float = 0.75    # confidence level where sizing maxes out
 
+    # --- Time-based exit ---------------------------------------------------------
+    # Backtester already simulates giving up on a position after
+    # prediction_horizon_bars * 3 bars (see Backtester.run_symbol), but the
+    # live loop previously had NO equivalent -- a live position could sit
+    # open indefinitely as long as neither the bracket stop/take nor a model
+    # flip resolved it, silently diverging from what --backtest actually
+    # validates and tying up buying power that could go to a fresher signal.
+    enable_time_based_exit: bool = True
+    time_exit_max_hold_bars: int = 32   # ~8h at 15-min bars
+
     # --- Risk management -----------------------------------------------------
     risk_per_trade_pct: float = 0.01     # fraction of equity risked per trade
     max_positions: int = 5
@@ -2820,6 +2830,13 @@ class TradingBot:
         # symbol -> last-known has_edge() result, so we log only on transitions
         self._edge_state_cache: Dict[str, bool] = {}
 
+        # symbol -> approximate entry time, for the time-based exit. Best
+        # effort across a restart: a position observed open without a
+        # recorded entry time gets the clock started from when we first
+        # notice it rather than assumed stale, since we have no way to
+        # recover its real entry time from the Alpaca position object alone.
+        self._position_opened_at: Dict[str, datetime] = {}
+
         # cached adaptive sizing multiplier, refreshed on its own schedule
         self._performance_multiplier: float = 1.0
         self._performance_multiplier_checked_at: Optional[datetime] = None
@@ -3056,16 +3073,42 @@ class TradingBot:
         if already_in_position:
             position = open_positions[symbol]
             position_side = "BUY" if float(position.qty) > 0 else "SELL"
+
+            now = datetime.now(timezone.utc)
+            opened_at = self._position_opened_at.get(symbol)
+            if opened_at is None:
+                # First time we're seeing this open position (fresh entry
+                # this cycle, or a bot restart that lost in-memory state) --
+                # start the clock now rather than assuming it's stale.
+                opened_at = now
+                self._position_opened_at[symbol] = opened_at
+
             if signal.action != "FLAT" and signal.action != position_side:
                 self.logger.info(f"[{symbol}] model flipped against open position, closing")
                 self.executor.close_position(symbol)
                 self.trailing_stop_manager.reset(symbol)
                 self.scale_out_manager.reset(symbol)
-            else:
-                self.scale_out_manager.check_and_execute(
-                    symbol, signal.price, effective_stop_price=self.trailing_stop_manager.current_stop(symbol)
-                )
-                self.trailing_stop_manager.update(symbol, position, signal.price, signal.atr)
+                self._position_opened_at.pop(symbol, None)
+                return
+
+            if self.config.enable_time_based_exit:
+                bars_held = (now - opened_at).total_seconds() / 60.0 / self.config.timeframe_minutes()
+                if bars_held >= self.config.time_exit_max_hold_bars:
+                    self.logger.info(
+                        f"[{symbol}] time-based exit: held ~{bars_held:.1f} bars "
+                        f"(>= {self.config.time_exit_max_hold_bars}) without resolving via "
+                        "stop/take/model-flip, freeing the capital"
+                    )
+                    self.executor.close_position(symbol)
+                    self.trailing_stop_manager.reset(symbol)
+                    self.scale_out_manager.reset(symbol)
+                    self._position_opened_at.pop(symbol, None)
+                    return
+
+            self.scale_out_manager.check_and_execute(
+                symbol, signal.price, effective_stop_price=self.trailing_stop_manager.current_stop(symbol)
+            )
+            self.trailing_stop_manager.update(symbol, position, signal.price, signal.atr)
             return  # bracket order already manages stop/take on the resting order
 
         # --- No new entries if we're too close to the close ---
@@ -3130,6 +3173,7 @@ class TradingBot:
         if order is not None or self.config.dry_run:
             order_id = str(order.id) if order is not None else ""
             self.journal.log_trade(signal, qty, stop_price, full_take_price, order_id=order_id)
+            self._position_opened_at[symbol] = datetime.now(timezone.utc)
 
         if self.config.enable_partial_scale_out and qty >= 2:
             _, near_take_price = self.risk_manager.stop_take_levels(
@@ -3214,6 +3258,9 @@ class TradingBot:
                 for tracked_symbol in self.scale_out_manager.tracked_symbols():
                     if tracked_symbol not in open_positions:
                         self.scale_out_manager.reset(tracked_symbol)
+                for tracked_symbol in list(self._position_opened_at.keys()):
+                    if tracked_symbol not in open_positions:
+                        self._position_opened_at.pop(tracked_symbol, None)
 
                 if (
                     minutes_to_close is not None
