@@ -357,6 +357,16 @@ class TradingConfig:
     risk_per_trade_pct: float = 0.01     # fraction of equity risked per trade
     max_positions: int = 5
     max_position_pct_of_equity: float = 0.25  # cap notional per symbol
+    # max_position_pct_of_equity only bounds a SINGLE symbol's notional --
+    # with max_positions=5 and a 25% per-symbol cap, the account could
+    # otherwise reach up to 125% of equity in SIMULTANEOUS notional
+    # exposure (i.e. real leverage) if several positions all happen to
+    # size at their individual max at once. This caps total exposure
+    # across every open position combined. 1.0 = never use margin/leverage
+    # at all. Live-only (see TradingBot._process_symbol) -- the backtest
+    # gives each symbol its own independent $100k, so a shared portfolio
+    # exposure concept doesn't apply there.
+    max_total_exposure_pct: float = 1.0
     max_daily_loss_pct: float = 0.03     # halt all new trades after this drawdown
     stop_loss_atr_mult: float = 2.0
     take_profit_atr_mult: float = 3.0
@@ -1852,6 +1862,28 @@ class RiskManager:
             )
             return True
         return False
+
+    def exposure_capped_qty(
+        self, proposed_qty: int, price: float, equity: float, current_exposure: float
+    ) -> int:
+        """
+        Caps `proposed_qty` so that adding this position never pushes
+        TOTAL portfolio notional exposure (every other currently open
+        position's market value, plus this one) past
+        max_total_exposure_pct of equity. See that config field's
+        docstring for why this exists -- max_position_pct_of_equity alone
+        only bounds a single symbol, not the account in aggregate.
+        Returns 0 if there's no remaining budget at all, rather than a
+        negative or nonsensical quantity.
+        """
+        if proposed_qty <= 0 or price <= 0:
+            return 0
+        max_total_exposure = equity * self.config.max_total_exposure_pct
+        remaining_budget = max_total_exposure - current_exposure
+        if remaining_budget <= 0:
+            return 0
+        max_qty_by_budget = int(remaining_budget / price)
+        return max(0, min(proposed_qty, max_qty_by_budget))
 
 
 # ==============================================================================
@@ -3412,6 +3444,33 @@ class TradingBot:
         self._symbol_performance_multiplier_cache[symbol] = (now, multiplier)
         return multiplier
 
+    @staticmethod
+    def _current_portfolio_exposure(open_positions: Dict[str, object]) -> float:
+        """
+        Sums notional market value across every currently open position,
+        for RiskManager.exposure_capped_qty. Uses each position's own
+        reported market_value (magnitude, since a short position's
+        market_value can come back negative) rather than recomputing from
+        qty * some price this bot happens to have handy, since Alpaca's
+        own figure is definitionally correct. Falls back to
+        qty * current_price for the rare case market_value is missing,
+        and skips (rather than crashes on) any position this can't be
+        computed for.
+        """
+        total = 0.0
+        for position in open_positions.values():
+            try:
+                market_value = getattr(position, "market_value", None)
+                if market_value is not None:
+                    total += abs(float(market_value))
+                else:
+                    qty = float(getattr(position, "qty", 0) or 0)
+                    price = float(getattr(position, "current_price", 0) or 0)
+                    total += abs(qty) * price
+            except (TypeError, ValueError):
+                continue
+        return total
+
     # ------------------------------------------------------------- model
     def _train_symbol(self, symbol: str, raw_bars: pd.DataFrame) -> None:
         model = self.models[symbol]
@@ -3575,6 +3634,15 @@ class TradingBot:
             symbol_multiplier=symbol_multiplier,
         )
         if qty <= 0:
+            return
+
+        current_exposure = self._current_portfolio_exposure(open_positions)
+        qty = self.risk_manager.exposure_capped_qty(qty, signal.price, equity, current_exposure)
+        if qty <= 0:
+            self.logger.info(
+                f"[{symbol}] skip entry: no remaining portfolio exposure budget "
+                f"(current=${current_exposure:,.0f}, cap={self.config.max_total_exposure_pct:.0%} of equity)"
+            )
             return
 
         if self.executor.has_open_orders(symbol):
