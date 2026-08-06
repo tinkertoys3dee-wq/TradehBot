@@ -245,8 +245,18 @@ class TradingConfig:
     ])
     timeframe_amount: int = 15
     timeframe_unit: str = "Minute"       # "Minute", "Hour", "Day"
-    lookback_days: int = 60              # history pulled for training/features
+    lookback_days: int = 60              # LIVE history window -- retrained every retrain_interval_minutes, doesn't need years of stale history
     min_bars_required: int = 250         # minimum bars before we'll train/trade a symbol
+    # Separate, much longer history window used ONLY by --backtest. Two
+    # backtests in one day already showed results are sensitive to which
+    # ~60-day slice you happen to test on -- the only way to know whether
+    # an edge is real and stable rather than one-window luck is testing
+    # across genuinely different market regimes (trending/choppy,
+    # different volatility periods), which needs actual years of data.
+    # Alpaca's available history depends on your data plan; if less than
+    # this comes back, the existing min_bars_required / empty-data checks
+    # already degrade gracefully rather than crashing.
+    backtest_lookback_days: int = 730
 
     # --- Model / retraining -------------------------------------------------
     prediction_horizon_bars: int = 4     # predict direction N bars ahead (used only when triple_barrier_labeling is off)
@@ -649,9 +659,18 @@ class AlpacaDataFeed:
             self.logger.error(f"Failed to compute minutes to close: {exc}")
             return None
 
-    def fetch_bars(self, symbol: str) -> pd.DataFrame:
-        """Pull `lookback_days` of bars for `symbol` and return a clean DataFrame."""
-        start = datetime.now(timezone.utc) - timedelta(days=self.config.lookback_days)
+    def fetch_bars(self, symbol: str, lookback_days: Optional[int] = None) -> pd.DataFrame:
+        """
+        Pull `lookback_days` (default: config.lookback_days, the live
+        training/feature window) of bars for `symbol` and return a clean
+        DataFrame. Backtester passes config.backtest_lookback_days
+        explicitly instead -- backtesting benefits from much more history
+        than the live bot needs to keep retraining against every couple
+        hours, so the two are deliberately decoupled rather than sharing
+        one value.
+        """
+        days = lookback_days if lookback_days is not None else self.config.lookback_days
+        start = datetime.now(timezone.utc) - timedelta(days=days)
         request = StockBarsRequest(
             symbol_or_symbols=symbol,
             timeframe=self.config.timeframe(),
@@ -2968,7 +2987,7 @@ class Backtester:
         fallback run_symbol_walkforward uses when there isn't enough
         out-of-sample data to support multiple folds.
         """
-        raw_bars = self.data_feed.fetch_bars(symbol)
+        raw_bars = self.data_feed.fetch_bars(symbol, lookback_days=self.config.backtest_lookback_days)
         if raw_bars.empty:
             self.logger.warning(f"[{symbol}] no historical bars for backtest")
             return None
@@ -3027,7 +3046,7 @@ class Backtester:
         at the cost of retraining n_folds times instead of once per
         symbol.
         """
-        raw_bars = self.data_feed.fetch_bars(symbol)
+        raw_bars = self.data_feed.fetch_bars(symbol, lookback_days=self.config.backtest_lookback_days)
         if raw_bars.empty:
             self.logger.warning(f"[{symbol}] no historical bars for backtest")
             return None
@@ -3109,7 +3128,9 @@ class Backtester:
     def run(self) -> pd.DataFrame:
         market_df = None
         if self.config.market_context_enabled:
-            market_df = self.data_feed.fetch_bars(self.config.market_context_symbol)
+            market_df = self.data_feed.fetch_bars(
+                self.config.market_context_symbol, lookback_days=self.config.backtest_lookback_days
+            )
             if market_df.empty:
                 self.logger.warning(
                     f"[{self.config.market_context_symbol}] no bars for market-context "
@@ -3122,7 +3143,7 @@ class Backtester:
                 self.config.sector_map[s] for s in self.config.symbols if s in self.config.sector_map
             }
             for etf in needed_etfs:
-                bars = self.data_feed.fetch_bars(etf)
+                bars = self.data_feed.fetch_bars(etf, lookback_days=self.config.backtest_lookback_days)
                 if bars.empty:
                     self.logger.warning(
                         f"[{etf}] no bars for sector-context features -- symbols mapped to "
