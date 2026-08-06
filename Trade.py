@@ -288,6 +288,27 @@ class TradingConfig:
     market_context_symbol: str = "SPY"
     market_context_refresh_minutes: int = 15
 
+    # --- Sector-relative context features ---------------------------------------
+    # Same idea as market-context, one level more specific: a semiconductor
+    # selling off with the rest of chip stocks while the broad market is flat
+    # is a different situation than it selling off alone. Approximate
+    # GICS/SPDR sector mapping for the current symbol universe -- symbols not
+    # listed here (index ETFs like SPY/QQQ, or CIBR which is itself a sector
+    # ETF) simply don't get sector-relative features, same fail-safe neutral
+    # degradation as everywhere else in FeatureEngineer.
+    sector_context_enabled: bool = True
+    sector_context_refresh_minutes: int = 15
+    sector_map: Dict[str, str] = field(default_factory=lambda: {
+        "AAPL": "XLK", "MSFT": "XLK", "NVDA": "XLK", "AMD": "XLK", "GRMN": "XLK",
+        "GOOGL": "XLC", "META": "XLC",
+        "AMZN": "XLY", "TSLA": "XLY", "HD": "XLY",
+        "COST": "XLP",
+        "JPM": "XLF", "BAC": "XLF",
+        "UNH": "XLV", "LLY": "XLV",
+        "XOM": "XLE", "CVX": "XLE",
+        "CAT": "XLI",
+    })
+
     # --- Session-relative (intraday seasonality) features -----------------------
     # VWAP deviation, gap-from-prior-close, and return-since-session-open, all
     # reset per trading day. These are standard intraday-trading signals that
@@ -717,6 +738,9 @@ class FeatureEngineer:
         "rel_strength_5", "rel_strength_10",
         "mkt_atr_percentile",
         "vwap_dev", "gap_from_prev_close", "return_since_open",
+        "sector_return_5", "sector_return_10",
+        "sector_rel_strength_5", "sector_rel_strength_10",
+        "sector_atr_percentile",
     ]
 
     def __init__(self, atr_percentile_window: int = 100):
@@ -895,6 +919,7 @@ class FeatureEngineer:
         df: pd.DataFrame,
         market_df: Optional[pd.DataFrame] = None,
         session_features_enabled: bool = True,
+        sector_df: Optional[pd.DataFrame] = None,
     ) -> pd.DataFrame:
         """Return a copy of df with all feature columns (and raw ATR) added.
         `market_df` (raw OHLCV bars for config.market_context_symbol, same
@@ -902,6 +927,10 @@ class FeatureEngineer:
         market-relative features aren't silently neutral; must be supplied
         consistently at both training and live-inference time or those
         features become a source of train/inference skew rather than signal.
+        `sector_df` (raw OHLCV bars for this symbol's mapped sector ETF, see
+        TradingConfig.sector_map) is the same idea one level more specific;
+        None for symbols with no sector mapping (index ETFs, etc.) is
+        expected and fine, not an error case.
         """
         if df.empty or len(df) < 30:
             return pd.DataFrame()
@@ -967,6 +996,13 @@ class FeatureEngineer:
         out["mkt_atr_percentile"] = mkt_atr_pctile
         out["rel_strength_5"] = out["return_5"] - out["mkt_return_5"]
         out["rel_strength_10"] = out["return_10"] - out["mkt_return_10"]
+
+        sector_ret_5, sector_ret_10, sector_atr_pctile = self._market_context_series(out.index, sector_df)
+        out["sector_return_5"] = sector_ret_5
+        out["sector_return_10"] = sector_ret_10
+        out["sector_atr_percentile"] = sector_atr_pctile
+        out["sector_rel_strength_5"] = out["return_5"] - out["sector_return_5"]
+        out["sector_rel_strength_10"] = out["return_10"] - out["sector_return_10"]
 
         if session_features_enabled:
             session_feats = self._session_relative_features(out)
@@ -1046,9 +1082,13 @@ class FeatureEngineer:
         raw_bars: pd.DataFrame,
         config: "TradingConfig",
         market_df: Optional[pd.DataFrame] = None,
+        sector_df: Optional[pd.DataFrame] = None,
     ) -> pd.DataFrame:
         feats = self.add_features(
-            raw_bars, market_df=market_df, session_features_enabled=config.session_features_enabled
+            raw_bars,
+            market_df=market_df,
+            session_features_enabled=config.session_features_enabled,
+            sector_df=sector_df,
         )
         if feats.empty:
             return feats
@@ -2648,14 +2688,20 @@ class Backtester:
         return (1 + cost_frac) if buying else (1 - cost_frac)
 
     def run_symbol(
-        self, symbol: str, starting_equity: float = 100_000.0, market_df: Optional[pd.DataFrame] = None
+        self,
+        symbol: str,
+        starting_equity: float = 100_000.0,
+        market_df: Optional[pd.DataFrame] = None,
+        sector_df: Optional[pd.DataFrame] = None,
     ) -> Optional[Dict]:
         raw_bars = self.data_feed.fetch_bars(symbol)
         if raw_bars.empty:
             self.logger.warning(f"[{symbol}] no historical bars for backtest")
             return None
 
-        dataset = self.feature_engineer.build_dataset(raw_bars, self.config, market_df=market_df)
+        dataset = self.feature_engineer.build_dataset(
+            raw_bars, self.config, market_df=market_df, sector_df=sector_df
+        )
         if len(dataset) < self.config.min_bars_required:
             self.logger.warning(f"[{symbol}] not enough bars for a meaningful backtest")
             return None
@@ -2779,10 +2825,26 @@ class Backtester:
                     "features -- backtest will use neutral values for those features."
                 )
 
+        sector_bars_by_etf: Dict[str, pd.DataFrame] = {}
+        if self.config.sector_context_enabled:
+            needed_etfs = {
+                self.config.sector_map[s] for s in self.config.symbols if s in self.config.sector_map
+            }
+            for etf in needed_etfs:
+                bars = self.data_feed.fetch_bars(etf)
+                if bars.empty:
+                    self.logger.warning(
+                        f"[{etf}] no bars for sector-context features -- symbols mapped to "
+                        "it will use neutral values for those features."
+                    )
+                sector_bars_by_etf[etf] = bars
+
         results = []
         for symbol in self.config.symbols:
             self.logger.info(f"[{symbol}] running backtest...")
-            result = self.run_symbol(symbol, market_df=market_df)
+            sector_etf = self.config.sector_map.get(symbol)
+            sector_df = sector_bars_by_etf.get(sector_etf) if sector_etf else None
+            result = self.run_symbol(symbol, market_df=market_df, sector_df=sector_df)
             if result is not None:
                 results.append(result)
                 self.logger.info(
@@ -2844,6 +2906,10 @@ class TradingBot:
         # across every symbol's training/inference this cycle instead of
         # re-fetched per symbol
         self._market_bars_cache: Optional[Tuple[datetime, pd.DataFrame]] = None
+
+        # sector ETF ticker -> (last_fetched_at, bars), shared across every
+        # symbol mapped to that sector instead of re-fetched per symbol
+        self._sector_bars_cache: Dict[str, Tuple[datetime, pd.DataFrame]] = {}
 
         # symbol -> last-known has_edge() result, so we log only on transitions
         self._edge_state_cache: Dict[str, bool] = {}
@@ -2951,6 +3017,30 @@ class TradingBot:
         self._market_bars_cache = (now, bars)
         return bars
 
+    def _get_sector_bars(self, symbol: str) -> Optional[pd.DataFrame]:
+        """
+        Cached fetch of `symbol`'s mapped sector ETF bars (see
+        TradingConfig.sector_map), keyed by ETF ticker so every symbol
+        sharing a sector (e.g. AAPL/MSFT/NVDA all -> XLK) reuses one fetch
+        per cycle instead of one each. Returns None (features degrade to
+        neutral) if the symbol has no sector mapping, the feature is
+        disabled, or the fetch fails -- never raises.
+        """
+        if not self.config.sector_context_enabled:
+            return None
+        sector_etf = self.config.sector_map.get(symbol)
+        if sector_etf is None:
+            return None
+        now = datetime.now(timezone.utc)
+        cached = self._sector_bars_cache.get(sector_etf)
+        if cached is not None:
+            fetched_at, bars = cached
+            if now - fetched_at < timedelta(minutes=self.config.sector_context_refresh_minutes):
+                return bars
+        bars = self.data_feed.fetch_bars(sector_etf)
+        self._sector_bars_cache[sector_etf] = (now, bars)
+        return bars
+
     def _model_has_edge(self, symbol: str, model: MLSignalModel) -> bool:
         """
         Wraps model.has_edge() with state-transition logging, so a symbol
@@ -3011,8 +3101,9 @@ class TradingBot:
             return
 
         market_df = self._get_market_context_bars()
+        sector_df = self._get_sector_bars(symbol)
         dataset = self.feature_engineer.build_dataset(
-            raw_bars, self.config, market_df=market_df
+            raw_bars, self.config, market_df=market_df, sector_df=sector_df
         )
         if dataset.empty:
             self.logger.warning(f"[{symbol}] feature dataset empty after cleaning, skipping training")
@@ -3063,8 +3154,12 @@ class TradingBot:
                 return
 
         market_df = self._get_market_context_bars()
+        sector_df = self._get_sector_bars(symbol)
         features = self.feature_engineer.add_features(
-            raw_bars, market_df=market_df, session_features_enabled=self.config.session_features_enabled
+            raw_bars,
+            market_df=market_df,
+            session_features_enabled=self.config.session_features_enabled,
+            sector_df=sector_df,
         )
         if features.empty:
             return
