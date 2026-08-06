@@ -160,6 +160,7 @@ try:
     from sklearn.preprocessing import StandardScaler
     from sklearn.model_selection import TimeSeriesSplit
     from sklearn.metrics import accuracy_score, precision_score, roc_auc_score
+    from sklearn.calibration import CalibratedClassifierCV
     import joblib
 except ImportError as exc:  # pragma: no cover
     raise SystemExit(
@@ -167,6 +168,16 @@ except ImportError as exc:  # pragma: no cover
         "    pip install scikit-learn joblib\n"
         f"Original error: {exc}"
     )
+
+# sklearn >=1.6 replaced CalibratedClassifierCV(cv="prefit") with wrapping the
+# already-fitted estimator in FrozenEstimator; older sklearn doesn't have
+# FrozenEstimator at all. Support both so this doesn't break on whatever
+# sklearn version ends up installed on the deploy target.
+try:
+    from sklearn.frozen import FrozenEstimator
+    _HAS_FROZEN_ESTIMATOR = True
+except ImportError:
+    _HAS_FROZEN_ESTIMATOR = False
 
 # --------------------------------------------------------------------------
 # Alpaca SDK (alpaca-py)
@@ -213,17 +224,69 @@ class TradingConfig:
     paper: bool = True  # NEVER set False in this script. See TradingBot._safety_check.
 
     # --- Universe & bar settings ------------------------------------------
-    symbols: List[str] = field(default_factory=lambda: ["AAPL", "MSFT", "SPY", "QQQ", "NVDA","AMZN","META","TSLA","GRMN","CIBR"])
+    # Expanded beyond the original mega-cap-tech-heavy list so the bot has
+    # independent (less correlated) setups to trade across more sectors --
+    # the old list left correlation_group caps blocking most of the day
+    # once 1-2 mega-cap-tech names were in play, and everything else in it
+    # (SPY/QQQ, GRMN, CIBR) moves together with "risk on/off" sentiment.
+    symbols: List[str] = field(default_factory=lambda: [
+        "AAPL", "MSFT", "SPY", "QQQ", "NVDA", "AMZN", "META", "TSLA", "GRMN", "CIBR",
+        "GOOGL", "AMD",              # mega-cap tech / semis
+        "JPM", "BAC",                # financials
+        "UNH", "LLY",                # healthcare
+        "XOM", "CVX",                # energy
+        "CAT",                       # industrials
+        "HD", "COST",                # consumer retail
+    ])
     timeframe_amount: int = 15
     timeframe_unit: str = "Minute"       # "Minute", "Hour", "Day"
     lookback_days: int = 60              # history pulled for training/features
     min_bars_required: int = 250         # minimum bars before we'll train/trade a symbol
 
     # --- Model / retraining -------------------------------------------------
-    prediction_horizon_bars: int = 4     # predict direction N bars ahead
+    prediction_horizon_bars: int = 4     # predict direction N bars ahead (used only when triple_barrier_labeling is off)
     retrain_interval_minutes: int = 120  # how often to refit the model
     min_train_accuracy: float = 0.50     # sanity floor; below this we stay flat
     min_prediction_confidence: float = 0.58  # min predicted P(up) / P(down) to act
+
+    # --- Triple-barrier labeling ---------------------------------------------
+    # The original label was "is price higher in exactly N bars" -- on 15-min
+    # bars for liquid large caps that's close to a coin flip by construction,
+    # since it counts a $0.01 drift the same as a real move. This instead
+    # labels each bar by which symmetric ATR-scaled barrier it hits first
+    # (a decisive up-move vs. a decisive down-move) within a look-ahead
+    # window, and DROPS bars where neither barrier is cleanly hit (chop) or
+    # both are touched in the same bar (can't tell which came first from
+    # OHLC data alone). Fewer, cleaner training rows in exchange for a label
+    # that's actually about tradeable moves instead of noise. See
+    # FeatureEngineer.add_labels.
+    triple_barrier_labeling: bool = True
+    label_barrier_atr_mult: float = 2.5   # symmetric distance (in ATRs) that defines a "decisive" move
+    label_max_hold_bars: int = 16         # vertical barrier -- give up (drop the row) if neither side hits within this many bars
+
+    # --- Probability calibration -----------------------------------------------
+    # Raw GradientBoosting/RandomForest probabilities are usually not
+    # trustworthy as actual probabilities (tree ensembles tend to be
+    # overconfident) -- thresholding min_prediction_confidence against them
+    # is close to meaningless without this. Calibration fits the final
+    # model on most of the data, holds out a chronologically-later slice
+    # never used for fitting, and learns a correction curve so
+    # predict_proba's output is closer to "if the model says 0.65, it's
+    # actually right about 65% of the time" -- which is what makes a
+    # confidence threshold an honest odds-of-success number.
+    probability_calibration_enabled: bool = True
+    calibration_holdout_fraction: float = 0.15
+    calibration_method: str = "sigmoid"   # "sigmoid" (Platt -- better for small holdouts) or "isotonic"
+
+    # --- Market-context (cross-sectional) features -----------------------------
+    # A single symbol's own technical indicators say nothing about whether
+    # the whole market is ripping or dumping at the same time -- most of a
+    # liquid large-cap's short-term move is beta to the market, not
+    # idiosyncratic. Adds the benchmark's own returns/volatility regime and
+    # this symbol's return relative to it, aligned by timestamp.
+    market_context_enabled: bool = True
+    market_context_symbol: str = "SPY"
+    market_context_refresh_minutes: int = 15
 
     # --- Risk management -----------------------------------------------------
     risk_per_trade_pct: float = 0.01     # fraction of equity risked per trade
@@ -232,7 +295,11 @@ class TradingConfig:
     max_daily_loss_pct: float = 0.03     # halt all new trades after this drawdown
     stop_loss_atr_mult: float = 2.0
     take_profit_atr_mult: float = 3.0
-    trailing_stop: bool = False
+    # On by default: TrailingStopManager only ever tightens a resting stop
+    # (never loosens it), so this can only reduce give-back on winners --
+    # unlike partial scale-out, there's no failure mode where it leaves a
+    # position under-protected.
+    trailing_stop: bool = True
 
     # --- Multi-timeframe trend confirmation --------------------------------
     require_daily_trend_confirmation: bool = True
@@ -243,7 +310,11 @@ class TradingConfig:
     correlation_groups: Dict[str, List[str]] = field(
         default_factory=lambda: {
             "broad_market": ["SPY", "QQQ", "DIA", "IWM"],
-            "mega_cap_tech": ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META"],
+            "mega_cap_tech": ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "AMD"],
+            "financials": ["JPM", "BAC"],
+            "healthcare": ["UNH", "LLY"],
+            "energy": ["XOM", "CVX"],
+            "consumer_retail": ["HD", "COST"],
         }
     )
     max_positions_per_correlation_group: int = 2
@@ -323,6 +394,14 @@ class TradingConfig:
             "Day": TimeFrameUnit.Day,
         }
         return TimeFrame(self.timeframe_amount, unit_map[self.timeframe_unit])
+
+    def label_horizon_bars(self) -> int:
+        """
+        The furthest a label ever looks ahead -- used both as the walk-forward
+        CV embargo width (so a training fold's label can never peek into its
+        validation fold) and as the embargo before the calibration holdout.
+        """
+        return self.label_max_hold_bars if self.triple_barrier_labeling else self.prediction_horizon_bars
 
 
 # ==============================================================================
@@ -580,6 +659,10 @@ class FeatureEngineer:
         "momentum_10",
         "volatility_10",
         "atr_percentile",
+        "tod_sin", "tod_cos",
+        "mkt_return_5", "mkt_return_10",
+        "rel_strength_5", "rel_strength_10",
+        "mkt_atr_percentile",
     ]
 
     def __init__(self, atr_percentile_window: int = 100):
@@ -647,8 +730,71 @@ class FeatureEngineer:
         d = k.rolling(smooth).mean().fillna(50)
         return k, d
 
-    def add_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Return a copy of df with all feature columns (and raw ATR) added."""
+    @staticmethod
+    def _time_of_day_cyclical(index: pd.Index) -> Tuple[pd.Series, pd.Series]:
+        """
+        Encodes each bar's position within the regular equity session
+        (9:30-16:00 ET) as a cyclical sin/cos pair, so the model can learn
+        real intraday seasonality (opening-range volatility, midday chop,
+        closing imbalance) instead of treating every bar as interchangeable.
+        Falls back to neutral (0, 0) if the index isn't tz-aware or the
+        timezone database isn't available -- never raises.
+        """
+        neutral = pd.Series(0.0, index=index)
+        if not isinstance(index, pd.DatetimeIndex) or index.tz is None:
+            return neutral, neutral.copy()
+        try:
+            et_index = index.tz_convert("America/New_York")
+            minutes = et_index.hour.to_numpy() * 60 + et_index.minute.to_numpy()
+            session_open = 9 * 60 + 30
+            session_len = 390.0  # 6.5h regular session
+            frac = np.clip((minutes - session_open) / session_len, 0.0, 1.0)
+            angle = 2 * np.pi * frac
+            return pd.Series(np.sin(angle), index=index), pd.Series(np.cos(angle), index=index)
+        except Exception:
+            return neutral, neutral.copy()
+
+    def _market_context_series(
+        self, index: pd.Index, market_df: Optional[pd.DataFrame]
+    ) -> Tuple[pd.Series, pd.Series, pd.Series]:
+        """
+        Computes the market benchmark's own 5/10-bar returns and ATR
+        percentile, aligned onto `index` (forward-filled for any bar
+        timestamps that don't line up exactly). Returns neutral series
+        (0.0 / 0.0 / 0.5) when no market data is available, so callers
+        never have to special-case a missing benchmark.
+        """
+        neutral_ret = pd.Series(0.0, index=index)
+        neutral_pctile = pd.Series(0.5, index=index)
+        if market_df is None or market_df.empty or len(market_df) < 30:
+            return neutral_ret, neutral_ret.copy(), neutral_pctile
+
+        try:
+            mkt = market_df.sort_index()
+            mkt_close = mkt["close"]
+            mkt_ret_5 = mkt_close.pct_change(5)
+            mkt_ret_10 = mkt_close.pct_change(10)
+            mkt_atr = self._atr(mkt, 14)
+            mkt_atr_pctile = mkt_atr.rolling(
+                self.atr_percentile_window,
+                min_periods=max(10, self.atr_percentile_window // 4),
+            ).rank(pct=True)
+
+            aligned_ret5 = mkt_ret_5.reindex(index, method="ffill").fillna(0.0)
+            aligned_ret10 = mkt_ret_10.reindex(index, method="ffill").fillna(0.0)
+            aligned_pctile = mkt_atr_pctile.reindex(index, method="ffill").fillna(0.5)
+            return aligned_ret5, aligned_ret10, aligned_pctile
+        except Exception:
+            return neutral_ret, neutral_ret.copy(), neutral_pctile
+
+    def add_features(self, df: pd.DataFrame, market_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+        """Return a copy of df with all feature columns (and raw ATR) added.
+        `market_df` (raw OHLCV bars for config.market_context_symbol, same
+        timeframe) is optional -- pass it whenever available so the
+        market-relative features aren't silently neutral; must be supplied
+        consistently at both training and live-inference time or those
+        features become a source of train/inference skew rather than signal.
+        """
         if df.empty or len(df) < 30:
             return pd.DataFrame()
 
@@ -705,23 +851,100 @@ class FeatureEngineer:
         out["atr_percentile"] = atr.rolling(atr_window, min_periods=max(10, atr_window // 4)).rank(pct=True)
         out["atr_percentile"] = out["atr_percentile"].fillna(0.5)  # neutral until enough history
 
+        out["tod_sin"], out["tod_cos"] = self._time_of_day_cyclical(out.index)
+
+        mkt_ret_5, mkt_ret_10, mkt_atr_pctile = self._market_context_series(out.index, market_df)
+        out["mkt_return_5"] = mkt_ret_5
+        out["mkt_return_10"] = mkt_ret_10
+        out["mkt_atr_percentile"] = mkt_atr_pctile
+        out["rel_strength_5"] = out["return_5"] - out["mkt_return_5"]
+        out["rel_strength_10"] = out["return_10"] - out["mkt_return_10"]
+
         out = out.replace([np.inf, -np.inf], np.nan)
         return out
 
-    def add_labels(self, df: pd.DataFrame, horizon: int) -> pd.DataFrame:
-        """Binary label: 1 if close `horizon` bars ahead is higher than now."""
+    def add_labels(
+        self,
+        df: pd.DataFrame,
+        horizon: int,
+        triple_barrier: bool = False,
+        barrier_atr_mult: float = 2.5,
+        max_hold: int = 16,
+    ) -> pd.DataFrame:
+        """
+        Default: binary label = 1 if close `horizon` bars ahead is higher
+        than now. This is noisy by construction on short intraday horizons
+        -- a $0.01 drift counts the same as a real move.
+
+        `triple_barrier=True` instead labels each bar by which symmetric
+        ATR-scaled barrier (+/- barrier_atr_mult * ATR) price hits first
+        over the next `max_hold` bars: 1 if the up-barrier is hit first, 0
+        if the down-barrier is hit first. Bars where NEITHER barrier is
+        cleanly hit within the window (chop), or where both are touched
+        within the same bar (can't tell which came first from OHLC alone),
+        get target=NaN and are dropped downstream in build_dataset -- the
+        point is training on decisive, tradeable moves instead of noise.
+        """
         out = df.copy()
-        future_close = out["close"].shift(-horizon)
-        out["target"] = (future_close > out["close"]).astype(int)
+        if not triple_barrier:
+            future_close = out["close"].shift(-horizon)
+            out["target"] = (future_close > out["close"]).astype(int)
+            return out
+
+        close = out["close"].to_numpy()
+        high = out["high"].to_numpy()
+        low = out["low"].to_numpy()
+        atr = out["atr_14"].to_numpy()
+        n = len(out)
+        target = np.full(n, np.nan)
+
+        for i in range(n - 1):
+            entry = close[i]
+            a = atr[i]
+            if not np.isfinite(a) or a <= 0 or not np.isfinite(entry):
+                continue
+            upper = entry + barrier_atr_mult * a
+            lower = entry - barrier_atr_mult * a
+            end = min(i + 1 + max_hold, n)
+            label = np.nan
+            for j in range(i + 1, end):
+                hit_up = high[j] >= upper
+                hit_dn = low[j] <= lower
+                if hit_up and hit_dn:
+                    break  # ambiguous same-bar touch -- leave as NaN, drop
+                if hit_up:
+                    label = 1.0
+                    break
+                if hit_dn:
+                    label = 0.0
+                    break
+            target[i] = label
+
+        out["target"] = target
         return out
 
-    def build_dataset(self, raw_bars: pd.DataFrame, horizon: int) -> pd.DataFrame:
-        feats = self.add_features(raw_bars)
+    def build_dataset(
+        self,
+        raw_bars: pd.DataFrame,
+        config: "TradingConfig",
+        market_df: Optional[pd.DataFrame] = None,
+    ) -> pd.DataFrame:
+        feats = self.add_features(raw_bars, market_df=market_df)
         if feats.empty:
             return feats
-        labeled = self.add_labels(feats, horizon)
+        if config.triple_barrier_labeling:
+            labeled = self.add_labels(
+                feats,
+                config.prediction_horizon_bars,
+                triple_barrier=True,
+                barrier_atr_mult=config.label_barrier_atr_mult,
+                max_hold=config.label_max_hold_bars,
+            )
+        else:
+            labeled = self.add_labels(feats, config.prediction_horizon_bars)
         cols_needed = self.FEATURE_COLUMNS + ["target", "atr_14", "close"]
         labeled = labeled.dropna(subset=cols_needed)
+        labeled["target"] = labeled["target"].astype(int)
         return labeled
 
 
@@ -898,8 +1121,13 @@ class MLSignalModel:
     def train(self, dataset: pd.DataFrame) -> bool:
         """
         Fit on `dataset` (must contain FEATURE_COLUMNS + target). Uses a
-        walk-forward (TimeSeriesSplit) validation scheme so we never leak
-        future bars into training folds -- important for time series data.
+        walk-forward (TimeSeriesSplit) validation scheme, EMBARGOED by
+        config.label_horizon_bars() so a training fold's label -- which
+        looks up to that many bars into the future -- can never overlap
+        with its validation fold's bars. Without this, the last few rows
+        of every training fold have labels computed from bars that are
+        actually inside the validation fold right after it, which quietly
+        inflates the reported walk-forward accuracy.
         Returns True if the resulting model clears the min-accuracy bar.
         """
         if len(dataset) < self.config.min_bars_required:
@@ -911,13 +1139,22 @@ class MLSignalModel:
 
         X = dataset[FeatureEngineer.FEATURE_COLUMNS].values
         y = dataset["target"].values
+        embargo = self.config.label_horizon_bars()
 
         splitter = TimeSeriesSplit(n_splits=5)
         fold_accuracies, fold_aucs = [], []
 
         for train_idx, val_idx in splitter.split(X):
+            if embargo > 0 and len(train_idx) > embargo:
+                train_idx = train_idx[: len(train_idx) - embargo]
+            if len(train_idx) < 30 or len(val_idx) < 5:
+                continue
+            y_train_fold = y[train_idx]
+            if len(np.unique(y_train_fold)) < 2:
+                continue
+
             X_train, X_val = X[train_idx], X[val_idx]
-            y_train, y_val = y[train_idx], y[val_idx]
+            y_train, y_val = y_train_fold, y[val_idx]
 
             pipe = self._build_pipeline()
             pipe.fit(X_train, y_train)
@@ -933,9 +1170,7 @@ class MLSignalModel:
         val_accuracy = float(np.mean(fold_accuracies)) if fold_accuracies else 0.0
         val_auc = float(np.mean(fold_aucs)) if fold_aucs else 0.5
 
-        # Final fit on the full dataset for production use
-        final_pipeline = self._build_pipeline()
-        final_pipeline.fit(X, y)
+        final_pipeline, pipeline_for_importance = self._fit_production_pipeline(X, y, embargo)
 
         self.pipeline = final_pipeline
         self.last_trained_at = datetime.now(timezone.utc)
@@ -944,7 +1179,7 @@ class MLSignalModel:
         self.accuracy_history.append(val_accuracy)
         self.accuracy_history = self.accuracy_history[-self.config.model_quality_history_len:]
         self._save()
-        self._log_feature_importance(final_pipeline)
+        self._log_feature_importance(pipeline_for_importance)
 
         avg_recent = sum(self.accuracy_history) / len(self.accuracy_history)
         self.logger.info(
@@ -954,6 +1189,63 @@ class MLSignalModel:
         )
 
         return val_accuracy >= self.config.min_train_accuracy
+
+    def _fit_production_pipeline(
+        self, X: np.ndarray, y: np.ndarray, embargo: int
+    ) -> Tuple[object, Pipeline]:
+        """
+        Fits the model actually used for live predictions. When probability
+        calibration is enabled, holds out the chronologically-last slice of
+        the data (never used for fitting, with an embargo gap before it for
+        the same look-ahead-leakage reason as the CV folds) and learns a
+        calibration curve on it -- this is what makes
+        config.min_prediction_confidence an honest probability rather than
+        a raw, likely overconfident tree-ensemble score. Falls back to a
+        plain uncalibrated fit (on all the data) if there isn't enough data
+        to carve out a meaningful calibration holdout, or if calibration
+        itself fails for any reason -- a working uncalibrated model beats
+        no model.
+        Returns (pipeline_used_for_predictions, pipeline_used_for_feature_importance)
+        -- the latter is always a plain fitted Pipeline with named_steps,
+        even when the former is a CalibratedClassifierCV wrapper around one.
+        """
+        if self.config.probability_calibration_enabled:
+            n = len(X)
+            calib_n = max(1, int(n * self.config.calibration_holdout_fraction))
+            fit_end = n - calib_n
+            embargo_end = max(0, fit_end - embargo)
+            X_fit, y_fit = X[:embargo_end], y[:embargo_end]
+            X_cal, y_cal = X[fit_end:], y[fit_end:]
+
+            can_calibrate = (
+                len(X_fit) >= 50
+                and len(X_cal) >= 30
+                and len(np.unique(y_fit)) > 1
+                and len(np.unique(y_cal)) > 1
+            )
+            if can_calibrate:
+                try:
+                    base_pipeline = self._build_pipeline()
+                    base_pipeline.fit(X_fit, y_fit)
+                    if _HAS_FROZEN_ESTIMATOR:
+                        calibrated = CalibratedClassifierCV(
+                            FrozenEstimator(base_pipeline), method=self.config.calibration_method
+                        )
+                    else:
+                        calibrated = CalibratedClassifierCV(
+                            base_pipeline, method=self.config.calibration_method, cv="prefit"
+                        )
+                    calibrated.fit(X_cal, y_cal)
+                    return calibrated, base_pipeline
+                except Exception as exc:
+                    self.logger.warning(
+                        f"[{self.symbol}] probability calibration failed, "
+                        f"falling back to an uncalibrated model: {exc}"
+                    )
+
+        final_pipeline = self._build_pipeline()
+        final_pipeline.fit(X, y)
+        return final_pipeline, final_pipeline
 
     @staticmethod
     def _build_pipeline() -> Pipeline:
@@ -2189,13 +2481,15 @@ class Backtester:
         buying = (side == "BUY") == is_entry
         return (1 + cost_frac) if buying else (1 - cost_frac)
 
-    def run_symbol(self, symbol: str, starting_equity: float = 100_000.0) -> Optional[Dict]:
+    def run_symbol(
+        self, symbol: str, starting_equity: float = 100_000.0, market_df: Optional[pd.DataFrame] = None
+    ) -> Optional[Dict]:
         raw_bars = self.data_feed.fetch_bars(symbol)
         if raw_bars.empty:
             self.logger.warning(f"[{symbol}] no historical bars for backtest")
             return None
 
-        dataset = self.feature_engineer.build_dataset(raw_bars, self.config.prediction_horizon_bars)
+        dataset = self.feature_engineer.build_dataset(raw_bars, self.config, market_df=market_df)
         if len(dataset) < self.config.min_bars_required:
             self.logger.warning(f"[{symbol}] not enough bars for a meaningful backtest")
             return None
@@ -2307,10 +2601,19 @@ class Backtester:
         return result
 
     def run(self) -> pd.DataFrame:
+        market_df = None
+        if self.config.market_context_enabled:
+            market_df = self.data_feed.fetch_bars(self.config.market_context_symbol)
+            if market_df.empty:
+                self.logger.warning(
+                    f"[{self.config.market_context_symbol}] no bars for market-context "
+                    "features -- backtest will use neutral values for those features."
+                )
+
         results = []
         for symbol in self.config.symbols:
             self.logger.info(f"[{symbol}] running backtest...")
-            result = self.run_symbol(symbol)
+            result = self.run_symbol(symbol, market_df=market_df)
             if result is not None:
                 results.append(result)
                 self.logger.info(
@@ -2367,6 +2670,11 @@ class TradingBot:
 
         # symbol -> (last_checked_at, sentiment_score)
         self._news_sentiment_cache: Dict[str, Tuple[datetime, float]] = {}
+
+        # (last_fetched_at, bars) for config.market_context_symbol, shared
+        # across every symbol's training/inference this cycle instead of
+        # re-fetched per symbol
+        self._market_bars_cache: Optional[Tuple[datetime, pd.DataFrame]] = None
 
         # symbol -> last-known has_edge() result, so we log only on transitions
         self._edge_state_cache: Dict[str, bool] = {}
@@ -2446,6 +2754,27 @@ class TradingBot:
         self._news_sentiment_cache[symbol] = (now, score)
         return score
 
+    def _get_market_context_bars(self) -> Optional[pd.DataFrame]:
+        """
+        Cached fetch of the market-context benchmark's own bars, shared by
+        every symbol's feature computation this cycle. Must be used
+        consistently at both training and live-inference time -- if
+        training sees real market data but inference doesn't (or vice
+        versa), the market-relative features become a source of skew
+        rather than signal. Returns None (features degrade to neutral, see
+        FeatureEngineer) on any fetch failure rather than raising.
+        """
+        if not self.config.market_context_enabled:
+            return None
+        now = datetime.now(timezone.utc)
+        if self._market_bars_cache is not None:
+            fetched_at, bars = self._market_bars_cache
+            if now - fetched_at < timedelta(minutes=self.config.market_context_refresh_minutes):
+                return bars
+        bars = self.data_feed.fetch_bars(self.config.market_context_symbol)
+        self._market_bars_cache = (now, bars)
+        return bars
+
     def _model_has_edge(self, symbol: str, model: MLSignalModel) -> bool:
         """
         Wraps model.has_edge() with state-transition logging, so a symbol
@@ -2505,8 +2834,9 @@ class TradingBot:
             self.logger.warning(f"[{symbol}] no bar data returned, skipping training")
             return
 
+        market_df = self._get_market_context_bars()
         dataset = self.feature_engineer.build_dataset(
-            raw_bars, self.config.prediction_horizon_bars
+            raw_bars, self.config, market_df=market_df
         )
         if dataset.empty:
             self.logger.warning(f"[{symbol}] feature dataset empty after cleaning, skipping training")
@@ -2542,7 +2872,8 @@ class TradingBot:
             self.logger.info(f"[{symbol}] insufficient bar data, skipping")
             return
 
-        features = self.feature_engineer.add_features(raw_bars)
+        market_df = self._get_market_context_bars()
+        features = self.feature_engineer.add_features(raw_bars, market_df=market_df)
         if features.empty:
             return
         latest = features.iloc[-1]
