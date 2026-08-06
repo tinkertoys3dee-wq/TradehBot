@@ -288,6 +288,35 @@ class TradingConfig:
     market_context_symbol: str = "SPY"
     market_context_refresh_minutes: int = 15
 
+    # --- Session-relative (intraday seasonality) features -----------------------
+    # VWAP deviation, gap-from-prior-close, and return-since-session-open, all
+    # reset per trading day. These are standard intraday-trading signals that
+    # a bar's own rolling-window technical indicators can't see, since they
+    # need to know where "today" started.
+    session_features_enabled: bool = True
+
+    # --- Data staleness guard --------------------------------------------------
+    # Protects against acting on a frozen/lagging data feed: if the latest
+    # fetched bar is older than this many multiples of the bar timeframe, skip
+    # new decisions for that symbol this cycle instead of trading on stale
+    # prices. Existing positions stay protected regardless (their stop/take
+    # orders rest server-side on Alpaca), this only gates new signal
+    # processing.
+    max_bar_staleness_multiplier: float = 3.0
+
+    # --- Confidence-weighted position sizing ------------------------------------
+    # Scales risked size within the existing risk_per_trade_pct /
+    # max_position_pct_of_equity bounds based on how far the (calibrated)
+    # signal confidence sits above min_prediction_confidence -- put more size
+    # behind higher-conviction calls instead of sizing every trade that
+    # clears the threshold identically. The notional cap
+    # (max_position_pct_of_equity) still applies on top, so this can't push a
+    # position past the existing hard ceiling.
+    confidence_sizing_enabled: bool = True
+    confidence_sizing_min_multiplier: float = 0.75   # multiplier right at the confidence threshold
+    confidence_sizing_max_multiplier: float = 1.5    # multiplier at/above confidence_sizing_full_scale_at
+    confidence_sizing_full_scale_at: float = 0.75    # confidence level where sizing maxes out
+
     # --- Risk management -----------------------------------------------------
     risk_per_trade_pct: float = 0.01     # fraction of equity risked per trade
     max_positions: int = 5
@@ -394,6 +423,10 @@ class TradingConfig:
             "Day": TimeFrameUnit.Day,
         }
         return TimeFrame(self.timeframe_amount, unit_map[self.timeframe_unit])
+
+    def timeframe_minutes(self) -> float:
+        minutes_per_unit = {"Minute": 1.0, "Hour": 60.0, "Day": 60.0 * 24.0}
+        return self.timeframe_amount * minutes_per_unit.get(self.timeframe_unit, 1.0)
 
     def label_horizon_bars(self) -> int:
         """
@@ -663,6 +696,7 @@ class FeatureEngineer:
         "mkt_return_5", "mkt_return_10",
         "rel_strength_5", "rel_strength_10",
         "mkt_atr_percentile",
+        "vwap_dev", "gap_from_prev_close", "return_since_open",
     ]
 
     def __init__(self, atr_percentile_window: int = 100):
@@ -787,7 +821,61 @@ class FeatureEngineer:
         except Exception:
             return neutral_ret, neutral_ret.copy(), neutral_pctile
 
-    def add_features(self, df: pd.DataFrame, market_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    @staticmethod
+    def _session_relative_features(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Computes VWAP deviation, gap-from-prior-session-close, and
+        return-since-session-open, all reset per trading day (day
+        boundaries derived from the bar index converted to America/New_York
+        -- Alpaca bar timestamps are UTC). A single bar's rolling-window
+        technical indicators can't express any of these since they need to
+        know where "today" started. Falls back to all-neutral (0.0) if the
+        index isn't tz-aware or the timezone database isn't available --
+        never raises, matching the same fail-safe pattern used for the
+        time-of-day feature.
+        """
+        index = df.index
+        neutral = pd.DataFrame(
+            {"vwap_dev": 0.0, "gap_from_prev_close": 0.0, "return_since_open": 0.0}, index=index
+        )
+        if not isinstance(index, pd.DatetimeIndex) or index.tz is None:
+            return neutral
+
+        try:
+            et_index = index.tz_convert("America/New_York")
+            day = pd.Series(et_index.date, index=index)
+
+            typical_price = (df["high"] + df["low"] + df["close"]) / 3.0
+            pv_cumsum = (typical_price * df["volume"]).groupby(day).cumsum()
+            vol_cumsum = df["volume"].groupby(day).cumsum().replace(0, np.nan)
+            vwap = pv_cumsum / vol_cumsum
+            vwap_dev = ((df["close"] - vwap) / vwap.replace(0, np.nan)).fillna(0.0)
+
+            session_open = df["open"].groupby(day).transform("first")
+            return_since_open = (
+                (df["close"] - session_open) / session_open.replace(0, np.nan)
+            ).fillna(0.0)
+
+            prev_close_by_day = df["close"].groupby(day).last().shift(1)
+            prev_close = day.map(prev_close_by_day)
+            gap_from_prev_close = (
+                (session_open - prev_close) / prev_close.replace(0, np.nan)
+            ).fillna(0.0)
+
+            return pd.DataFrame({
+                "vwap_dev": vwap_dev,
+                "gap_from_prev_close": gap_from_prev_close,
+                "return_since_open": return_since_open,
+            })
+        except Exception:
+            return neutral
+
+    def add_features(
+        self,
+        df: pd.DataFrame,
+        market_df: Optional[pd.DataFrame] = None,
+        session_features_enabled: bool = True,
+    ) -> pd.DataFrame:
         """Return a copy of df with all feature columns (and raw ATR) added.
         `market_df` (raw OHLCV bars for config.market_context_symbol, same
         timeframe) is optional -- pass it whenever available so the
@@ -860,6 +948,16 @@ class FeatureEngineer:
         out["rel_strength_5"] = out["return_5"] - out["mkt_return_5"]
         out["rel_strength_10"] = out["return_10"] - out["mkt_return_10"]
 
+        if session_features_enabled:
+            session_feats = self._session_relative_features(out)
+        else:
+            session_feats = pd.DataFrame(
+                {"vwap_dev": 0.0, "gap_from_prev_close": 0.0, "return_since_open": 0.0}, index=out.index
+            )
+        out["vwap_dev"] = session_feats["vwap_dev"]
+        out["gap_from_prev_close"] = session_feats["gap_from_prev_close"]
+        out["return_since_open"] = session_feats["return_since_open"]
+
         out = out.replace([np.inf, -np.inf], np.nan)
         return out
 
@@ -929,7 +1027,9 @@ class FeatureEngineer:
         config: "TradingConfig",
         market_df: Optional[pd.DataFrame] = None,
     ) -> pd.DataFrame:
-        feats = self.add_features(raw_bars, market_df=market_df)
+        feats = self.add_features(
+            raw_bars, market_df=market_df, session_features_enabled=config.session_features_enabled
+        )
         if feats.empty:
             return feats
         if config.triple_barrier_labeling:
@@ -1504,23 +1604,61 @@ class RiskManager:
             return True
         return False
 
+    def confidence_size_multiplier(self, confidence: float) -> float:
+        """
+        Scales linearly from confidence_sizing_min_multiplier (right at
+        min_prediction_confidence, the weakest signal SignalGenerator would
+        ever act on) up to confidence_sizing_max_multiplier (at/above
+        confidence_sizing_full_scale_at) -- puts more size behind
+        higher-conviction calls instead of treating every signal that
+        clears the threshold identically. Only meaningful when
+        confidence is an actually-calibrated probability (see
+        TradingConfig.probability_calibration_enabled); with an
+        uncalibrated model this just scales by an arbitrary raw score.
+        """
+        if not self.config.confidence_sizing_enabled:
+            return 1.0
+        lo_conf = self.config.min_prediction_confidence
+        hi_conf = self.config.confidence_sizing_full_scale_at
+        if hi_conf <= lo_conf:
+            return 1.0
+        frac = (confidence - lo_conf) / (hi_conf - lo_conf)
+        frac = min(max(frac, 0.0), 1.0)
+        lo_mult = self.config.confidence_sizing_min_multiplier
+        hi_mult = self.config.confidence_sizing_max_multiplier
+        return lo_mult + frac * (hi_mult - lo_mult)
+
     def position_size(
-        self, equity: float, price: float, atr: float, performance_multiplier: float = 1.0
+        self,
+        equity: float,
+        price: float,
+        atr: float,
+        performance_multiplier: float = 1.0,
+        confidence_multiplier: float = 1.0,
     ) -> int:
         """
         Risk `risk_per_trade_pct` of equity, where the per-share risk is
-        `stop_loss_atr_mult * atr`. Also cap notional exposure per symbol.
+        `stop_loss_atr_mult * atr`. Also cap notional exposure per symbol --
+        that notional cap is a hard ceiling applied AFTER the multipliers
+        below, so neither of them can push a position past
+        max_position_pct_of_equity.
 
         `performance_multiplier` (default 1.0 = neutral) scales the risked
         dollar amount based on the strategy's recent realized performance --
         see PerformanceAnalyzer.recent_performance_multiplier. It's clamped
         to config.adaptive_sizing_{min,max}_multiplier by the caller, so
         it's applied here without re-clamping.
+
+        `confidence_multiplier` (default 1.0 = neutral) scales it further
+        based on how confident this particular signal is -- see
+        confidence_size_multiplier. Also pre-clamped by the caller.
         """
         if price <= 0 or atr <= 0:
             return 0
 
-        dollars_at_risk = equity * self.config.risk_per_trade_pct * performance_multiplier
+        dollars_at_risk = (
+            equity * self.config.risk_per_trade_pct * performance_multiplier * confidence_multiplier
+        )
         per_share_risk = self.config.stop_loss_atr_mult * atr
         if per_share_risk <= 0:
             return 0
@@ -2555,7 +2693,10 @@ class Backtester:
             if position is None:
                 signal = self.signal_generator.generate(symbol, model, row, daily_trend=None)
                 if signal.action in ("BUY", "SELL"):
-                    qty = self.risk_manager.position_size(equity, signal.price, signal.atr)
+                    confidence_multiplier = self.risk_manager.confidence_size_multiplier(signal.confidence)
+                    qty = self.risk_manager.position_size(
+                        equity, signal.price, signal.atr, confidence_multiplier=confidence_multiplier
+                    )
                     if qty > 0:
                         cost_mult = self._cost_multiplier(signal.action, is_entry=True)
                         entry_price = signal.price * cost_mult
@@ -2872,8 +3013,24 @@ class TradingBot:
             self.logger.info(f"[{symbol}] insufficient bar data, skipping")
             return
 
+        latest_bar_time = raw_bars.index[-1]
+        if isinstance(latest_bar_time, pd.Timestamp) and latest_bar_time.tzinfo is not None:
+            staleness_minutes = (
+                datetime.now(timezone.utc) - latest_bar_time.to_pydatetime()
+            ).total_seconds() / 60.0
+            max_staleness = self.config.timeframe_minutes() * self.config.max_bar_staleness_multiplier
+            if staleness_minutes > max_staleness:
+                self.logger.warning(
+                    f"[{symbol}] latest bar is {staleness_minutes:.1f} min old "
+                    f"(> {max_staleness:.1f} min threshold) -- skipping this cycle, "
+                    "possible data feed lag"
+                )
+                return
+
         market_df = self._get_market_context_bars()
-        features = self.feature_engineer.add_features(raw_bars, market_df=market_df)
+        features = self.feature_engineer.add_features(
+            raw_bars, market_df=market_df, session_features_enabled=self.config.session_features_enabled
+        )
         if features.empty:
             return
         latest = features.iloc[-1]
@@ -2929,8 +3086,13 @@ class TradingBot:
             return
 
         performance_multiplier = self._get_performance_multiplier()
+        confidence_multiplier = self.risk_manager.confidence_size_multiplier(signal.confidence)
         qty = self.risk_manager.position_size(
-            equity, signal.price, signal.atr, performance_multiplier=performance_multiplier
+            equity,
+            signal.price,
+            signal.atr,
+            performance_multiplier=performance_multiplier,
+            confidence_multiplier=confidence_multiplier,
         )
         if qty <= 0:
             return
