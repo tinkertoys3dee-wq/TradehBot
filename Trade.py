@@ -212,6 +212,79 @@ except ImportError as exc:  # pragma: no cover
 
 
 # ==============================================================================
+# 0.5 BROAD-SCREEN UNIVERSE (2026-08-07)
+# ==============================================================================
+# ~100 liquid, sector-diversified symbols for a broad backtest screen --
+# per-symbol edge should be evaluated on evidence (see the three-backtest
+# TSLA/AMD/XOM pruning earlier this session), not guessed at, so this
+# deliberately casts a wide net across every major GICS sector rather than
+# hand-picking favorites. Structured as sector -> (SPDR ETF ticker, symbols)
+# so TradingConfig.symbols, .sector_map, and .correlation_groups all derive
+# from ONE place instead of three hand-maintained lists that could drift
+# out of sync with each other.
+BROAD_SCREEN_SECTOR_BUCKETS: Dict[str, Tuple[str, List[str]]] = {
+    "tech_semis": ("XLK", [
+        "AAPL", "MSFT", "NVDA", "AMD", "AVGO", "ORCL", "CRM", "ADBE",
+        "INTC", "CSCO", "QCOM", "TXN", "NOW", "AMAT", "MU",
+    ]),
+    "communication_services": ("XLC", [
+        "GOOGL", "META", "NFLX", "DIS", "CMCSA", "T", "VZ", "TMUS",
+    ]),
+    "consumer_discretionary": ("XLY", [
+        "AMZN", "TSLA", "HD", "MCD", "NKE", "SBUX", "LOW", "BKNG",
+        "TJX", "MAR", "F", "ABNB",
+    ]),
+    "consumer_staples": ("XLP", [
+        "WMT", "PG", "KO", "PEP", "COST", "PM", "MO", "CL",
+    ]),
+    "financials": ("XLF", [
+        "JPM", "BAC", "WFC", "GS", "MS", "C", "SCHW", "AXP", "V", "MA",
+    ]),
+    "healthcare": ("XLV", [
+        "UNH", "LLY", "JNJ", "ABBV", "MRK", "PFE", "TMO", "ABT",
+        "DHR", "BMY", "AMGN", "GILD",
+    ]),
+    "energy": ("XLE", [
+        "XOM", "CVX", "COP", "SLB", "EOG", "MPC", "OXY",
+    ]),
+    "industrials": ("XLI", [
+        "CAT", "BA", "HON", "UPS", "RTX", "GE", "LMT", "DE",
+    ]),
+    "materials": ("XLB", [
+        "LIN", "APD", "SHW", "ECL",
+    ]),
+    "utilities": ("XLU", [
+        "NEE", "DUK",
+    ]),
+    "real_estate": ("XLRE", [
+        "PLD", "AMT",
+    ]),
+    "broad_market": ("SPY", [
+        "SPY", "QQQ", "DIA", "IWM",
+    ]),
+}
+# High-beta/momentum names and previously-tested symbols with no clean
+# single-sector-ETF mapping (or that ARE themselves a sector ETF, e.g.
+# CIBR) -- included in the universe but not in a correlation group, since
+# they aren't particularly correlated with each other.
+BROAD_SCREEN_UNGROUPED: List[str] = ["RBLX", "COIN", "PLTR", "SMCI", "SOFI", "RIVN", "GRMN", "CIBR"]
+
+
+def _broad_screen_symbols() -> List[str]:
+    symbols = [s for _, members in BROAD_SCREEN_SECTOR_BUCKETS.values() for s in members]
+    symbols += BROAD_SCREEN_UNGROUPED
+    return symbols
+
+
+def _broad_screen_sector_map() -> Dict[str, str]:
+    return {s: etf for etf, members in BROAD_SCREEN_SECTOR_BUCKETS.values() for s in members}
+
+
+def _broad_screen_correlation_groups() -> Dict[str, List[str]]:
+    return {name: list(members) for name, (_etf, members) in BROAD_SCREEN_SECTOR_BUCKETS.items()}
+
+
+# ==============================================================================
 # 1. CONFIGURATION
 # ==============================================================================
 
@@ -225,31 +298,18 @@ class TradingConfig:
     paper: bool = True  # NEVER set False in this script. See TradingBot._safety_check.
 
     # --- Universe & bar settings ------------------------------------------
-    # Pruned again on 2026-08-06 after a THIRD backtest -- this one a
-    # 4-fold walk-forward over 2 years of history (300+ trades for
-    # several symbols, vs. ~30-50 in the two earlier ~60-day tests).
-    # That's the first genuinely statistically meaningful test we've had,
-    # and it overturned half of the previous "consistent" group: HD, UNH,
-    # and QQQ all looked profitable across two overlapping ~60-day
-    # windows and turned out negative over 2 years -- proof that small
-    # samples were producing false positives, exactly the risk the longer
-    # backtest was built to catch.
-    #
-    # Only three symbols were profitable in ALL THREE independent tests
-    # (single-split, 60-day walk-forward, 2-year walk-forward): TSLA, AMD,
-    # XOM. Zero symbols were negative in all three -- everything else
-    # flipped sign at least once. NVDA was the closest call (positive in
-    # the two largest tests, negative only in the smallest) but still cut
-    # for consistency with the "prove it across every test" bar the rest
-    # of the universe was held to -- a symbol that's flipped sign before
-    # can flip again. See chat history for the full 3-way comparison.
-    #
-    # This is a real, explicit tradeoff against trading FREQUENCY (roughly
-    # 1-1.5 combined trades/day across these three vs. ~10/day with the
-    # broader universe) in favor of trading quality -- reflects the
-    # session's overall shift from "more trades" toward "trades with real
-    # evidence behind them."
-    symbols: List[str] = field(default_factory=lambda: ["TSLA", "AMD", "XOM"])
+    # 2026-08-07: temporarily widened to a ~100-symbol broad screen (see
+    # BROAD_SCREEN_SECTOR_BUCKETS above) so a full --backtest run can
+    # gather evidence across every major sector at once, rather than
+    # hand-picking candidates to test one at a time. This is explicitly a
+    # SCREENING step -- the plan is to prune back down to only the symbols
+    # that prove out (same evidence-based approach as the prior
+    # TSLA/AMD/XOM pruning: profitable across multiple independent
+    # backtests, not just one), not to trade all ~100 of these live as-is.
+    # The proven core (TSLA, AMD, XOM) is included so its edge keeps
+    # getting re-validated against fresh backtest runs alongside everything
+    # else being screened.
+    symbols: List[str] = field(default_factory=_broad_screen_symbols)
     timeframe_amount: int = 15
     timeframe_unit: str = "Minute"       # "Minute", "Hour", "Day"
     lookback_days: int = 60              # LIVE history window -- retrained every retrain_interval_minutes, doesn't need years of stale history
@@ -320,16 +380,7 @@ class TradingConfig:
     # degradation as everywhere else in FeatureEngineer.
     sector_context_enabled: bool = True
     sector_context_refresh_minutes: int = 15
-    sector_map: Dict[str, str] = field(default_factory=lambda: {
-        "AAPL": "XLK", "MSFT": "XLK", "NVDA": "XLK", "AMD": "XLK", "GRMN": "XLK",
-        "GOOGL": "XLC", "META": "XLC",
-        "AMZN": "XLY", "TSLA": "XLY", "HD": "XLY",
-        "COST": "XLP",
-        "JPM": "XLF", "BAC": "XLF",
-        "UNH": "XLV", "LLY": "XLV",
-        "XOM": "XLE", "CVX": "XLE",
-        "CAT": "XLI",
-    })
+    sector_map: Dict[str, str] = field(default_factory=_broad_screen_sector_map)
 
     # --- Session-relative (intraday seasonality) features -----------------------
     # VWAP deviation, gap-from-prior-close, and return-since-session-open, all
@@ -399,16 +450,13 @@ class TradingConfig:
     daily_trend_refresh_minutes: int = 60   # how often to re-check the daily trend
 
     # --- Correlation-aware exposure limits ----------------------------------
-    correlation_groups: Dict[str, List[str]] = field(
-        default_factory=lambda: {
-            "broad_market": ["SPY", "QQQ", "DIA", "IWM"],
-            "mega_cap_tech": ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "AMD"],
-            "financials": ["JPM", "BAC"],
-            "healthcare": ["UNH", "LLY"],
-            "energy": ["XOM", "CVX"],
-            "consumer_retail": ["HD", "COST"],
-        }
-    )
+    # Derived from the same BROAD_SCREEN_SECTOR_BUCKETS as sector_map, so
+    # the two can't drift out of sync with each other. Only matters live
+    # (Backtester doesn't call correlation_limit_reached -- each symbol
+    # gets its own independent equity in a backtest) but stays accurate
+    # for whenever any of this ~100-symbol screen graduates to live
+    # trading.
+    correlation_groups: Dict[str, List[str]] = field(default_factory=_broad_screen_correlation_groups)
     max_positions_per_correlation_group: int = 2
 
     # --- Backtesting cost model (basis points, round-trip) -------------------
