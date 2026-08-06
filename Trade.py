@@ -370,6 +370,16 @@ class TradingConfig:
     adaptive_sizing_max_multiplier: float = 1.5   # size up to 1.5x after a strong stretch
     adaptive_sizing_refresh_minutes: int = 30     # how often to recompute the multiplier
 
+    # Hard ceiling on the COMBINED performance x confidence sizing
+    # multiplier. Each is independently bounded (1.5x max apiece by
+    # default), but they're multiplicative in RiskManager.position_size --
+    # without this they could stack to 2.25x base risk_per_trade_pct on a
+    # single trade, which is a materially different risk envelope than the
+    # ~1.5x ceiling that already existed before confidence-weighted sizing
+    # was added. This keeps the effective per-trade risk ceiling where it
+    # already was.
+    max_combined_size_multiplier: float = 1.5
+
     # --- Volatility regime filter ---------------------------------------------
     volatility_regime_filter_enabled: bool = True
     atr_percentile_window: int = 100     # trailing bars used to rank current ATR
@@ -1662,13 +1672,21 @@ class RiskManager:
         `confidence_multiplier` (default 1.0 = neutral) scales it further
         based on how confident this particular signal is -- see
         confidence_size_multiplier. Also pre-clamped by the caller.
+
+        The two are multiplicative, so their PRODUCT is re-clamped to
+        config.max_combined_size_multiplier here -- each factor being
+        individually bounded doesn't stop them compounding past the
+        intended overall risk ceiling when both land near their max at
+        once (a strong recent streak AND a high-confidence signal is a
+        real, not just theoretical, case for them to coincide).
         """
         if price <= 0 or atr <= 0:
             return 0
 
-        dollars_at_risk = (
-            equity * self.config.risk_per_trade_pct * performance_multiplier * confidence_multiplier
+        combined_multiplier = min(
+            performance_multiplier * confidence_multiplier, self.config.max_combined_size_multiplier
         )
+        dollars_at_risk = equity * self.config.risk_per_trade_pct * combined_multiplier
         per_share_risk = self.config.stop_loss_atr_mult * atr
         if per_share_risk <= 0:
             return 0
