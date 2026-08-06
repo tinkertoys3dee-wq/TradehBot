@@ -407,14 +407,35 @@ class TradingConfig:
     adaptive_sizing_max_multiplier: float = 1.5   # size up to 1.5x after a strong stretch
     adaptive_sizing_refresh_minutes: int = 30     # how often to recompute the multiplier
 
-    # Hard ceiling on the COMBINED performance x confidence sizing
-    # multiplier. Each is independently bounded (1.5x max apiece by
+    # --- Per-symbol adaptive sizing ---------------------------------------------
+    # Same idea as adaptive_sizing_enabled above, but scoped to each
+    # symbol's OWN realized live trades instead of the whole account
+    # netted together. Backtesting (2026-08-06) showed some symbols are
+    # persistently profitable and others persistently not -- an
+    # account-wide multiplier can't see that, since a winning symbol and a
+    # losing one just average out in the combined trade history. This
+    # lets sizing lean into symbols actually working live and lean away
+    # from ones that aren't, using real realized P&L, which we have
+    # direct evidence tracks profitability (unlike walk-forward
+    # classification accuracy -- model_val_accuracy vs. actual backtest
+    # return correlation was only ~0.10-0.20 across two separate runs).
+    # Never suspends a symbol outright, only scales size within the same
+    # bounds as the account-wide multiplier -- model_quality_gate is
+    # still the hard on/off switch.
+    symbol_adaptive_sizing_enabled: bool = True
+    symbol_adaptive_sizing_lookback_trades: int = 10
+    symbol_adaptive_sizing_min_multiplier: float = 0.4
+    symbol_adaptive_sizing_max_multiplier: float = 1.5
+    symbol_adaptive_sizing_refresh_minutes: int = 30
+
+    # Hard ceiling on the COMBINED performance x confidence x per-symbol
+    # sizing multiplier. Each is independently bounded (1.5x max apiece by
     # default), but they're multiplicative in RiskManager.position_size --
-    # without this they could stack to 2.25x base risk_per_trade_pct on a
-    # single trade, which is a materially different risk envelope than the
-    # ~1.5x ceiling that already existed before confidence-weighted sizing
-    # was added. This keeps the effective per-trade risk ceiling where it
-    # already was.
+    # without this they could stack to a much larger multiple of base
+    # risk_per_trade_pct on a single trade than intended when several land
+    # near their max at once (a strong recent streak, a high-confidence
+    # signal, AND a symbol on a hot streak is a real, not just
+    # theoretical, case for them to coincide).
     max_combined_size_multiplier: float = 1.5
 
     # --- Volatility regime filter ---------------------------------------------
@@ -1733,36 +1754,44 @@ class RiskManager:
         atr: float,
         performance_multiplier: float = 1.0,
         confidence_multiplier: float = 1.0,
+        symbol_multiplier: float = 1.0,
     ) -> int:
         """
         Risk `risk_per_trade_pct` of equity, where the per-share risk is
         `stop_loss_atr_mult * atr`. Also cap notional exposure per symbol --
         that notional cap is a hard ceiling applied AFTER the multipliers
-        below, so neither of them can push a position past
+        below, so none of them can push a position past
         max_position_pct_of_equity.
 
         `performance_multiplier` (default 1.0 = neutral) scales the risked
-        dollar amount based on the strategy's recent realized performance --
-        see PerformanceAnalyzer.recent_performance_multiplier. It's clamped
-        to config.adaptive_sizing_{min,max}_multiplier by the caller, so
-        it's applied here without re-clamping.
+        dollar amount based on the strategy's ACCOUNT-WIDE recent realized
+        performance -- see PerformanceAnalyzer.recent_performance_multiplier.
+        Clamped to config.adaptive_sizing_{min,max}_multiplier by the
+        caller, so it's applied here without re-clamping.
 
         `confidence_multiplier` (default 1.0 = neutral) scales it further
         based on how confident this particular signal is -- see
         confidence_size_multiplier. Also pre-clamped by the caller.
 
-        The two are multiplicative, so their PRODUCT is re-clamped to
+        `symbol_multiplier` (default 1.0 = neutral) scales it further based
+        on THIS SYMBOL's own recent realized performance -- see
+        PerformanceAnalyzer.symbol_performance_multiplier. Also pre-clamped
+        by the caller.
+
+        All three are multiplicative, so their PRODUCT is re-clamped to
         config.max_combined_size_multiplier here -- each factor being
         individually bounded doesn't stop them compounding past the
-        intended overall risk ceiling when both land near their max at
-        once (a strong recent streak AND a high-confidence signal is a
-        real, not just theoretical, case for them to coincide).
+        intended overall risk ceiling when several land near their max at
+        once (a strong recent account-wide streak, a high-confidence
+        signal, AND a symbol on its own hot streak is a real, not just
+        theoretical, case for them to coincide).
         """
         if price <= 0 or atr <= 0:
             return 0
 
         combined_multiplier = min(
-            performance_multiplier * confidence_multiplier, self.config.max_combined_size_multiplier
+            performance_multiplier * confidence_multiplier * symbol_multiplier,
+            self.config.max_combined_size_multiplier,
         )
         dollars_at_risk = equity * self.config.risk_per_trade_pct * combined_multiplier
         per_share_risk = self.config.stop_loss_atr_mult * atr
@@ -2530,6 +2559,24 @@ class PerformanceAnalyzer:
 
         return pd.DataFrame(records)
 
+    @staticmethod
+    def _profit_factor_to_multiplier(
+        recent_pnl: pd.DataFrame, min_multiplier: float, max_multiplier: float
+    ) -> float:
+        """
+        Shared mapping from a set of recent realized trade P&Ls to a
+        sizing multiplier, centered on profit_factor=1.5 (a reasonable
+        "this is working" threshold) -> multiplier 1.0, with a 0.5x/point
+        slope, clamped to [min_multiplier, max_multiplier]. Used by both
+        the account-wide and per-symbol multipliers so the mapping itself
+        is only defined once.
+        """
+        gross_profit = recent_pnl[recent_pnl["pnl"] > 0]["pnl"].sum()
+        gross_loss = -recent_pnl[recent_pnl["pnl"] <= 0]["pnl"].sum()
+        profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else 2.0
+        multiplier = 1.0 + (profit_factor - 1.5) * 0.5
+        return float(np.clip(multiplier, min_multiplier, max_multiplier))
+
     def recent_performance_multiplier(
         self,
         lookback_trades: int = 20,
@@ -2537,17 +2584,15 @@ class PerformanceAnalyzer:
         max_multiplier: float = 1.5,
     ) -> float:
         """
-        Maps recent realized performance to a position-sizing multiplier,
-        so the bot scales risk down after a stretch of losing trades and
-        back up once it's demonstrated an edge -- rather than sizing every
-        trade identically regardless of how the strategy has actually been
+        Maps recent ACCOUNT-WIDE realized performance (every symbol's
+        closed trades combined) to a position-sizing multiplier, so the
+        bot scales risk down after a stretch of losing trades and back up
+        once it's demonstrated an edge -- rather than sizing every trade
+        identically regardless of how the strategy has actually been
         performing. Returns 1.0 (neutral) until there's enough closed-trade
         history to judge, and never fully zeroes out sizing even in a bad
-        stretch (bounded by min_multiplier).
-
-        The mapping is centered on profit_factor=1.5 (a reasonable "this is
-        working" threshold) -> multiplier 1.0, with a 0.5x/point slope,
-        clamped to [min_multiplier, max_multiplier].
+        stretch (bounded by min_multiplier). See symbol_performance_multiplier
+        for the same idea scoped to a single symbol.
         """
         fills_df = self._load_fills()
         if fills_df.empty:
@@ -2558,12 +2603,43 @@ class PerformanceAnalyzer:
             return 1.0  # not enough closed-trade history to judge yet
 
         recent = pnl_df.tail(lookback_trades)
-        gross_profit = recent[recent["pnl"] > 0]["pnl"].sum()
-        gross_loss = -recent[recent["pnl"] <= 0]["pnl"].sum()
-        profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else 2.0
+        return self._profit_factor_to_multiplier(recent, min_multiplier, max_multiplier)
 
-        multiplier = 1.0 + (profit_factor - 1.5) * 0.5
-        return float(np.clip(multiplier, min_multiplier, max_multiplier))
+    def symbol_performance_multiplier(
+        self,
+        symbol: str,
+        lookback_trades: int = 10,
+        min_multiplier: float = 0.4,
+        max_multiplier: float = 1.5,
+    ) -> float:
+        """
+        Same idea as recent_performance_multiplier, but scoped to a single
+        symbol's OWN realized trades instead of the whole account combined.
+        An account-wide multiplier can't tell a winning symbol from a
+        losing one if they're netting out together in the combined trade
+        history -- this lets sizing lean into symbols actually working
+        live and lean away from ones that aren't, using real realized
+        P&L. Returns 1.0 (neutral) until THIS symbol specifically has
+        enough closed-trade history to judge -- a new or infrequently
+        traded symbol isn't penalized for lack of data, and a thin
+        lookback_trades default (10, vs. 20 account-wide) reflects that
+        any one symbol accumulates closed trades slower than the whole
+        account does.
+        """
+        fills_df = self._load_fills()
+        if fills_df.empty:
+            return 1.0
+
+        symbol_fills = fills_df[fills_df["symbol"] == symbol]
+        if symbol_fills.empty:
+            return 1.0
+
+        pnl_df = self._realized_pnl_by_symbol(symbol_fills)
+        if len(pnl_df) < max(5, lookback_trades // 2):
+            return 1.0  # not enough closed-trade history for THIS symbol yet
+
+        recent = pnl_df.tail(lookback_trades)
+        return self._profit_factor_to_multiplier(recent, min_multiplier, max_multiplier)
 
     def slippage_report(self) -> pd.DataFrame:
         """
@@ -3112,6 +3188,9 @@ class TradingBot:
         self._performance_multiplier: float = 1.0
         self._performance_multiplier_checked_at: Optional[datetime] = None
 
+        # symbol -> (last_checked_at, multiplier) for per-symbol adaptive sizing
+        self._symbol_performance_multiplier_cache: Dict[str, Tuple[datetime, float]] = {}
+
         Path(config.state_dir).mkdir(parents=True, exist_ok=True)
         self.heartbeat_path = Path(config.state_dir) / config.heartbeat_file
 
@@ -3306,6 +3385,33 @@ class TradingBot:
         self._performance_multiplier_checked_at = now
         return multiplier
 
+    def _get_symbol_performance_multiplier(self, symbol: str) -> float:
+        """Cached per-symbol adaptive-sizing multiplier -- same refresh-
+        schedule reasoning as _get_performance_multiplier, just scoped to
+        one symbol's own realized trades. See
+        PerformanceAnalyzer.symbol_performance_multiplier."""
+        if not self.config.symbol_adaptive_sizing_enabled:
+            return 1.0
+
+        now = datetime.now(timezone.utc)
+        cached = self._symbol_performance_multiplier_cache.get(symbol)
+        if cached is not None:
+            checked_at, multiplier = cached
+            if now - checked_at < timedelta(minutes=self.config.symbol_adaptive_sizing_refresh_minutes):
+                return multiplier
+
+        multiplier = self.performance_analyzer.symbol_performance_multiplier(
+            symbol,
+            lookback_trades=self.config.symbol_adaptive_sizing_lookback_trades,
+            min_multiplier=self.config.symbol_adaptive_sizing_min_multiplier,
+            max_multiplier=self.config.symbol_adaptive_sizing_max_multiplier,
+        )
+        previous = self._symbol_performance_multiplier_cache.get(symbol)
+        if previous is None or abs(multiplier - previous[1]) > 1e-6:
+            self.logger.info(f"[{symbol}] per-symbol position-sizing multiplier updated to {multiplier:.2f}x")
+        self._symbol_performance_multiplier_cache[symbol] = (now, multiplier)
+        return multiplier
+
     # ------------------------------------------------------------- model
     def _train_symbol(self, symbol: str, raw_bars: pd.DataFrame) -> None:
         model = self.models[symbol]
@@ -3459,12 +3565,14 @@ class TradingBot:
 
         performance_multiplier = self._get_performance_multiplier()
         confidence_multiplier = self.risk_manager.confidence_size_multiplier(signal.confidence)
+        symbol_multiplier = self._get_symbol_performance_multiplier(symbol)
         qty = self.risk_manager.position_size(
             equity,
             signal.price,
             signal.atr,
             performance_multiplier=performance_multiplier,
             confidence_multiplier=confidence_multiplier,
+            symbol_multiplier=symbol_multiplier,
         )
         if qty <= 0:
             return
