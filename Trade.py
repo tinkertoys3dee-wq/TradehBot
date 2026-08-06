@@ -225,19 +225,23 @@ class TradingConfig:
     paper: bool = True  # NEVER set False in this script. See TradingBot._safety_check.
 
     # --- Universe & bar settings ------------------------------------------
-    # Expanded beyond the original mega-cap-tech-heavy list so the bot has
-    # independent (less correlated) setups to trade across more sectors --
-    # the old list left correlation_group caps blocking most of the day
-    # once 1-2 mega-cap-tech names were in play, and everything else in it
-    # (SPY/QQQ, GRMN, CIBR) moves together with "risk on/off" sentiment.
+    # Pruned on 2026-08-06 based on two backtests over the same ~60-day
+    # history (a single 30%-holdout split, then a 4-fold walk-forward).
+    # Dropped: CVX, CIBR, BAC, AMZN, SPY, JPM, LLY, META, CAT -- all lost
+    # money in BOTH tests (several with Sharpe -6 to -9 twice), the
+    # strongest evidence available so far of a persistent negative bias
+    # rather than noise. Kept everything else: symbols profitable in both
+    # tests (TSLA, AMD, HD, UNH, QQQ, XOM) plus symbols that flipped sign
+    # between the two runs (AAPL, NVDA, GOOGL, MSFT, COST, GRMN) -- a
+    # flip means the single-split result for those was likely noise, not
+    # that the symbol is bad, so they stay in rather than being cut on
+    # unproven grounds. Not proof either way (both tests draw from
+    # overlapping history, not genuinely different market regimes) --
+    # see chat history for the full comparison.
     symbols: List[str] = field(default_factory=lambda: [
-        "AAPL", "MSFT", "SPY", "QQQ", "NVDA", "AMZN", "META", "TSLA", "GRMN", "CIBR",
-        "GOOGL", "AMD",              # mega-cap tech / semis
-        "JPM", "BAC",                # financials
-        "UNH", "LLY",                # healthcare
-        "XOM", "CVX",                # energy
-        "CAT",                       # industrials
-        "HD", "COST",                # consumer retail
+        "TSLA", "AMD", "HD",              # consistently positive, strongest signal (Sharpe 4+ in both tests)
+        "UNH", "QQQ", "XOM",              # consistently positive, smaller magnitude
+        "AAPL", "NVDA", "GOOGL", "MSFT", "COST", "GRMN",  # flipped sign between tests -- unproven, not excluded
     ])
     timeframe_amount: int = 15
     timeframe_unit: str = "Minute"       # "Minute", "Hour", "Day"
