@@ -238,7 +238,6 @@ class TradingConfig:
         "XOM", "CVX",                # energy
         "CAT",                       # industrials
         "HD", "COST",                # consumer retail
-        "RBLX",                      # Volatile Stocks
     ])
     timeframe_amount: int = 15
     timeframe_unit: str = "Minute"       # "Minute", "Hour", "Day"
@@ -384,7 +383,18 @@ class TradingConfig:
     # --- Backtesting cost model (basis points, round-trip) -------------------
     backtest_spread_bps: float = 5.0
     backtest_slippage_bps: float = 2.0
-    backtest_test_fraction: float = 0.3   # fraction of history held out as the walk-forward test window
+    backtest_test_fraction: float = 0.3   # total fraction of history held out across ALL walk-forward folds combined
+    # >=2 runs an expanding-window walk-forward backtest instead of one
+    # train/test split: an initial seed training window, then this many
+    # successive out-of-sample folds, each retrained on all data up to
+    # that point, with equity carried forward fold-to-fold into one
+    # continuous out-of-sample curve. A single 30% holdout window can be
+    # dominated by whether that particular slice of history happened to
+    # suit the model -- this is a meaningfully stronger read on whether an
+    # edge is real and stable. Costs more runtime (n_folds retrains
+    # instead of 1 per symbol). 0 or 1 falls back to the single-split
+    # behavior.
+    backtest_walkforward_folds: int = 4
 
     # --- Adaptive, performance-based position sizing -------------------------
     adaptive_sizing_enabled: bool = True
@@ -438,8 +448,20 @@ class TradingConfig:
     model_quality_min_avg_accuracy: float = 0.51  # below this, suspend NEW entries (existing positions still managed)
 
     # --- Entry order type (bounded-slippage limit entries) --------------------
-    entry_order_type: str = "market"        # "market" or "limit"
-    entry_limit_buffer_bps: float = 5.0     # for "limit": how far through the reference price to allow
+    # Switched to "limit" after live evidence on 2026-08-06: RBLX/MSFT/CVX
+    # all had entry attempts during fast-moving/gappy stretches where the
+    # reference price (last closed bar) was stale by the time the order
+    # reached Alpaca -- RBLX alone had 8 rejected re-entry attempts
+    # ("stop_loss.stop_price must be >= base_price + 0.01") while price ran
+    # away from its stop. Rejections are the safe case; a "market" entry
+    # that DOES fill during that same window can end up with a real
+    # risk-per-share wider than RiskManager sized for, since qty was
+    # computed from the stale price/ATR. A limit entry instead simply
+    # doesn't fill if price has already moved past entry_limit_buffer_bps --
+    # missing the trade beats taking on undersized-looking risk that's
+    # actually oversized.
+    entry_order_type: str = "limit"         # "market" or "limit"
+    entry_limit_buffer_bps: float = 5.0     # how far through the reference price to allow
 
     # --- Loop timing -----------------------------------------------------------
     poll_interval_seconds: int = 60
@@ -2699,38 +2721,17 @@ class Backtester:
         buying = (side == "BUY") == is_entry
         return (1 + cost_frac) if buying else (1 - cost_frac)
 
-    def run_symbol(
-        self,
-        symbol: str,
-        starting_equity: float = 100_000.0,
-        market_df: Optional[pd.DataFrame] = None,
-        sector_df: Optional[pd.DataFrame] = None,
-    ) -> Optional[Dict]:
-        raw_bars = self.data_feed.fetch_bars(symbol)
-        if raw_bars.empty:
-            self.logger.warning(f"[{symbol}] no historical bars for backtest")
-            return None
-
-        dataset = self.feature_engineer.build_dataset(
-            raw_bars, self.config, market_df=market_df, sector_df=sector_df
-        )
-        if len(dataset) < self.config.min_bars_required:
-            self.logger.warning(f"[{symbol}] not enough bars for a meaningful backtest")
-            return None
-
-        split_idx = int(len(dataset) * (1 - self.config.backtest_test_fraction))
-        train_df = dataset.iloc[:split_idx]
-        test_df = dataset.iloc[split_idx:]
-        if len(test_df) < 30:
-            self.logger.warning(f"[{symbol}] test window too short, adjust backtest_test_fraction")
-            return None
-
-        model = MLSignalModel(f"{symbol}_backtest", self.config, self.logger)
-        model.train(train_df)
-        if model.pipeline is None:
-            self.logger.warning(f"[{symbol}] backtest model failed to train")
-            return None
-
+    def _simulate_trades(
+        self, symbol: str, model: MLSignalModel, test_df: pd.DataFrame, starting_equity: float
+    ) -> Tuple[List[Dict], List[float], float]:
+        """
+        Walks bar-by-bar through `test_df` (already-featured/labeled rows,
+        chronologically ordered) simulating entries/exits against a trained
+        `model`, using the same signal/risk logic as everywhere else.
+        Shared by both the single-split and walk-forward backtest paths so
+        the simulation itself is never maintained in two places. Returns
+        (trades, equity_curve, ending_equity).
+        """
         equity = starting_equity
         equity_curve = [equity]
         position: Optional[Dict] = None
@@ -2798,34 +2799,200 @@ class Backtester:
 
             equity_curve.append(equity)
 
+        return trades, equity_curve, equity
+
+    def _build_result(
+        self,
+        symbol: str,
+        trades: List[Dict],
+        equity_curve: List[float],
+        starting_equity: float,
+        ending_equity: float,
+        fold_val_accuracies: List[float],
+    ) -> Dict:
         equity_series = pd.Series(equity_curve)
         max_dd = PerformanceAnalyzer._max_drawdown(equity_series)
         sharpe = PerformanceAnalyzer._sharpe_ratio(equity_series, periods_per_year=252 * 26)
 
         trades_df = pd.DataFrame(trades)
         win_rate = float((trades_df["pnl"] > 0).mean()) if len(trades_df) else 0.0
-        total_return = (equity / starting_equity) - 1
+        total_return = (ending_equity / starting_equity) - 1
 
-        result = {
+        return {
             "symbol": symbol,
             "n_trades": len(trades_df),
             "win_rate": win_rate,
             "total_return": total_return,
-            "final_equity": equity,
+            "final_equity": ending_equity,
             "max_drawdown": max_dd,
             "sharpe_approx": sharpe,
-            "model_val_accuracy": model.last_val_accuracy,
+            "model_val_accuracy": float(np.mean(fold_val_accuracies)) if fold_val_accuracies else 0.0,
+            "n_folds": len(fold_val_accuracies),
         }
 
-        # Clean up the throwaway backtest model file so it doesn't get
-        # confused with the live model cache.
+    @staticmethod
+    def _cleanup_backtest_model(model: MLSignalModel) -> None:
+        """Deletes the throwaway backtest model file so it doesn't get
+        confused with the live model cache."""
         try:
             if model.model_path.exists():
                 model.model_path.unlink()
         except Exception:
             pass
 
+    def run_symbol(
+        self,
+        symbol: str,
+        starting_equity: float = 100_000.0,
+        market_df: Optional[pd.DataFrame] = None,
+        sector_df: Optional[pd.DataFrame] = None,
+    ) -> Optional[Dict]:
+        """
+        Single chronological train/test split -- one training window, one
+        held-out test window. Used when config.backtest_walkforward_folds
+        <= 1; otherwise run() calls run_symbol_walkforward instead, which
+        is a meaningfully stronger read on whether an edge is real (see
+        its docstring). Kept as its own method since it's also the
+        fallback run_symbol_walkforward uses when there isn't enough
+        out-of-sample data to support multiple folds.
+        """
+        raw_bars = self.data_feed.fetch_bars(symbol)
+        if raw_bars.empty:
+            self.logger.warning(f"[{symbol}] no historical bars for backtest")
+            return None
+
+        dataset = self.feature_engineer.build_dataset(
+            raw_bars, self.config, market_df=market_df, sector_df=sector_df
+        )
+        if len(dataset) < self.config.min_bars_required:
+            self.logger.warning(f"[{symbol}] not enough bars for a meaningful backtest")
+            return None
+
+        split_idx = int(len(dataset) * (1 - self.config.backtest_test_fraction))
+        train_df = dataset.iloc[:split_idx]
+        test_df = dataset.iloc[split_idx:]
+        if len(test_df) < 30:
+            self.logger.warning(f"[{symbol}] test window too short, adjust backtest_test_fraction")
+            return None
+
+        model = MLSignalModel(f"{symbol}_backtest", self.config, self.logger)
+        model.train(train_df)
+        if model.pipeline is None:
+            self.logger.warning(f"[{symbol}] backtest model failed to train")
+            return None
+
+        trades, equity_curve, ending_equity = self._simulate_trades(symbol, model, test_df, starting_equity)
+        result = self._build_result(
+            symbol, trades, equity_curve, starting_equity, ending_equity, [model.last_val_accuracy]
+        )
+        self._cleanup_backtest_model(model)
         return result
+
+    def run_symbol_walkforward(
+        self,
+        symbol: str,
+        starting_equity: float = 100_000.0,
+        market_df: Optional[pd.DataFrame] = None,
+        sector_df: Optional[pd.DataFrame] = None,
+    ) -> Optional[Dict]:
+        """
+        Expanding-window walk-forward backtest: an initial seed training
+        window (sized so the REMAINING history, held out across all
+        folds combined, equals config.backtest_test_fraction), then
+        config.backtest_walkforward_folds successive out-of-sample test
+        folds. Each fold is preceded by retraining on ALL data up to that
+        point (embargoed by label_horizon_bars(), same look-ahead-leakage
+        reasoning as the CV folds in MLSignalModel.train) -- so later
+        folds benefit from more history, mirroring periodic retraining
+        live. Equity carries forward fold-to-fold into one continuous
+        out-of-sample curve instead of resetting each time.
+
+        This exists because a single train/test split's result can be
+        dominated by whether that one particular slice of history
+        happened to suit the model -- good or bad. Walking forward through
+        several folds is a meaningfully stronger signal that an edge (or
+        lack of one) is real and stable rather than a one-window fluke,
+        at the cost of retraining n_folds times instead of once per
+        symbol.
+        """
+        raw_bars = self.data_feed.fetch_bars(symbol)
+        if raw_bars.empty:
+            self.logger.warning(f"[{symbol}] no historical bars for backtest")
+            return None
+
+        dataset = self.feature_engineer.build_dataset(
+            raw_bars, self.config, market_df=market_df, sector_df=sector_df
+        )
+        if len(dataset) < self.config.min_bars_required:
+            self.logger.warning(f"[{symbol}] not enough bars for a meaningful backtest")
+            return None
+
+        n_folds = max(1, self.config.backtest_walkforward_folds)
+        seed_end = int(len(dataset) * (1 - self.config.backtest_test_fraction))
+        oos_len = len(dataset) - seed_end
+        fold_size = oos_len // n_folds
+        # 30 bars (~1 trading day at 15-min bars) is a floor, not a target --
+        # below it a fold is too thin to produce a meaningful trade sample
+        # (a handful of bars can easily see zero signals fire at all, per
+        # triple-barrier + confidence gating), so it wouldn't tell us
+        # anything a single split doesn't already.
+        if seed_end < self.config.min_bars_required or fold_size < 30:
+            self.logger.warning(
+                f"[{symbol}] not enough out-of-sample data for {n_folds} walk-forward folds "
+                f"({oos_len} rows available) -- falling back to a single split"
+            )
+            return self.run_symbol(symbol, starting_equity, market_df=market_df, sector_df=sector_df)
+
+        embargo = self.config.label_horizon_bars()
+        equity = starting_equity
+        combined_equity_curve = [equity]
+        combined_trades: List[Dict] = []
+        fold_val_accuracies: List[float] = []
+
+        fold_start = seed_end
+        for fold_idx in range(n_folds):
+            fold_end = len(dataset) if fold_idx == n_folds - 1 else fold_start + fold_size
+            test_df = dataset.iloc[fold_start:fold_end]
+            if len(test_df) < 10:
+                break
+
+            train_end = max(0, fold_start - embargo)
+            train_df = dataset.iloc[:train_end]
+            if len(train_df) < self.config.min_bars_required:
+                fold_start = fold_end
+                continue
+
+            model = MLSignalModel(f"{symbol}_backtest_wf", self.config, self.logger)
+            model.train(train_df)
+            if model.pipeline is None:
+                self.logger.warning(
+                    f"[{symbol}] fold {fold_idx + 1}/{n_folds}: model failed to train, skipping fold"
+                )
+                self._cleanup_backtest_model(model)
+                fold_start = fold_end
+                continue
+
+            trades, fold_equity_curve, equity = self._simulate_trades(symbol, model, test_df, equity)
+            combined_trades.extend(trades)
+            combined_equity_curve.extend(fold_equity_curve[1:])  # drop duplicate leading point
+            fold_val_accuracies.append(model.last_val_accuracy)
+            self._cleanup_backtest_model(model)
+
+            self.logger.info(
+                f"[{symbol}] fold {fold_idx + 1}/{n_folds}: train_n={len(train_df)} test_n={len(test_df)} "
+                f"val_acc={model.last_val_accuracy:.3f} trades_this_fold={len(trades)} "
+                f"equity_after=${equity:,.2f}"
+            )
+
+            fold_start = fold_end
+
+        if not fold_val_accuracies:
+            self.logger.warning(f"[{symbol}] no walk-forward folds completed")
+            return None
+
+        return self._build_result(
+            symbol, combined_trades, combined_equity_curve, starting_equity, equity, fold_val_accuracies
+        )
 
     def run(self) -> pd.DataFrame:
         market_df = None
@@ -2851,16 +3018,20 @@ class Backtester:
                     )
                 sector_bars_by_etf[etf] = bars
 
+        use_walkforward = self.config.backtest_walkforward_folds >= 2
         results = []
         for symbol in self.config.symbols:
-            self.logger.info(f"[{symbol}] running backtest...")
+            self.logger.info(f"[{symbol}] running {'walk-forward ' if use_walkforward else ''}backtest...")
             sector_etf = self.config.sector_map.get(symbol)
             sector_df = sector_bars_by_etf.get(sector_etf) if sector_etf else None
-            result = self.run_symbol(symbol, market_df=market_df, sector_df=sector_df)
+            if use_walkforward:
+                result = self.run_symbol_walkforward(symbol, market_df=market_df, sector_df=sector_df)
+            else:
+                result = self.run_symbol(symbol, market_df=market_df, sector_df=sector_df)
             if result is not None:
                 results.append(result)
                 self.logger.info(
-                    f"[{symbol}] backtest: trades={result['n_trades']} "
+                    f"[{symbol}] backtest: folds={result.get('n_folds', 1)} trades={result['n_trades']} "
                     f"win_rate={result['win_rate']:.2%} "
                     f"return={result['total_return']:.2%} "
                     f"max_dd={result['max_drawdown']:.2%} "
