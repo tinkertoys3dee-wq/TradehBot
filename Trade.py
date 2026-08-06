@@ -136,6 +136,7 @@ import sys
 import time
 import traceback
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict, fields
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -288,6 +289,66 @@ class TradingConfig:
     market_context_symbol: str = "SPY"
     market_context_refresh_minutes: int = 15
 
+    # --- Sector-relative context features ---------------------------------------
+    # Same idea as market-context, one level more specific: a semiconductor
+    # selling off with the rest of chip stocks while the broad market is flat
+    # is a different situation than it selling off alone. Approximate
+    # GICS/SPDR sector mapping for the current symbol universe -- symbols not
+    # listed here (index ETFs like SPY/QQQ, or CIBR which is itself a sector
+    # ETF) simply don't get sector-relative features, same fail-safe neutral
+    # degradation as everywhere else in FeatureEngineer.
+    sector_context_enabled: bool = True
+    sector_context_refresh_minutes: int = 15
+    sector_map: Dict[str, str] = field(default_factory=lambda: {
+        "AAPL": "XLK", "MSFT": "XLK", "NVDA": "XLK", "AMD": "XLK", "GRMN": "XLK",
+        "GOOGL": "XLC", "META": "XLC",
+        "AMZN": "XLY", "TSLA": "XLY", "HD": "XLY",
+        "COST": "XLP",
+        "JPM": "XLF", "BAC": "XLF",
+        "UNH": "XLV", "LLY": "XLV",
+        "XOM": "XLE", "CVX": "XLE",
+        "CAT": "XLI",
+    })
+
+    # --- Session-relative (intraday seasonality) features -----------------------
+    # VWAP deviation, gap-from-prior-close, and return-since-session-open, all
+    # reset per trading day. These are standard intraday-trading signals that
+    # a bar's own rolling-window technical indicators can't see, since they
+    # need to know where "today" started.
+    session_features_enabled: bool = True
+
+    # --- Data staleness guard --------------------------------------------------
+    # Protects against acting on a frozen/lagging data feed: if the latest
+    # fetched bar is older than this many multiples of the bar timeframe, skip
+    # new decisions for that symbol this cycle instead of trading on stale
+    # prices. Existing positions stay protected regardless (their stop/take
+    # orders rest server-side on Alpaca), this only gates new signal
+    # processing.
+    max_bar_staleness_multiplier: float = 3.0
+
+    # --- Confidence-weighted position sizing ------------------------------------
+    # Scales risked size within the existing risk_per_trade_pct /
+    # max_position_pct_of_equity bounds based on how far the (calibrated)
+    # signal confidence sits above min_prediction_confidence -- put more size
+    # behind higher-conviction calls instead of sizing every trade that
+    # clears the threshold identically. The notional cap
+    # (max_position_pct_of_equity) still applies on top, so this can't push a
+    # position past the existing hard ceiling.
+    confidence_sizing_enabled: bool = True
+    confidence_sizing_min_multiplier: float = 0.75   # multiplier right at the confidence threshold
+    confidence_sizing_max_multiplier: float = 1.5    # multiplier at/above confidence_sizing_full_scale_at
+    confidence_sizing_full_scale_at: float = 0.75    # confidence level where sizing maxes out
+
+    # --- Time-based exit ---------------------------------------------------------
+    # Backtester already simulates giving up on a position after
+    # prediction_horizon_bars * 3 bars (see Backtester.run_symbol), but the
+    # live loop previously had NO equivalent -- a live position could sit
+    # open indefinitely as long as neither the bracket stop/take nor a model
+    # flip resolved it, silently diverging from what --backtest actually
+    # validates and tying up buying power that could go to a fresher signal.
+    enable_time_based_exit: bool = True
+    time_exit_max_hold_bars: int = 32   # ~8h at 15-min bars
+
     # --- Risk management -----------------------------------------------------
     risk_per_trade_pct: float = 0.01     # fraction of equity risked per trade
     max_positions: int = 5
@@ -330,6 +391,16 @@ class TradingConfig:
     adaptive_sizing_min_multiplier: float = 0.5   # size down to half after a bad stretch
     adaptive_sizing_max_multiplier: float = 1.5   # size up to 1.5x after a strong stretch
     adaptive_sizing_refresh_minutes: int = 30     # how often to recompute the multiplier
+
+    # Hard ceiling on the COMBINED performance x confidence sizing
+    # multiplier. Each is independently bounded (1.5x max apiece by
+    # default), but they're multiplicative in RiskManager.position_size --
+    # without this they could stack to 2.25x base risk_per_trade_pct on a
+    # single trade, which is a materially different risk envelope than the
+    # ~1.5x ceiling that already existed before confidence-weighted sizing
+    # was added. This keeps the effective per-trade risk ceiling where it
+    # already was.
+    max_combined_size_multiplier: float = 1.5
 
     # --- Volatility regime filter ---------------------------------------------
     volatility_regime_filter_enabled: bool = True
@@ -374,6 +445,16 @@ class TradingConfig:
     entry_cutoff_minutes_before_close: int = 20  # stop opening new positions late in day
     flatten_before_close_minutes: int = 5        # close all positions before the bell
 
+    # --- Concurrency ------------------------------------------------------------
+    # Bar fetches are pure I/O (read-only GET requests) and independent per
+    # symbol, so they're fetched concurrently instead of one-at-a-time --
+    # with 21 symbols plus sector-context ETFs, sequential fetching was
+    # adding up. Bounded so a growing symbol universe doesn't open unbounded
+    # simultaneous connections to Alpaca. Order submission and every
+    # decision in _process_symbol stays fully sequential -- only the data-
+    # gathering step is concurrent.
+    max_concurrent_bar_fetches: int = 8
+
     # --- Bookkeeping --------------------------------------------------------
     model_dir: str = "models"
     log_dir: str = "logs"
@@ -394,6 +475,10 @@ class TradingConfig:
             "Day": TimeFrameUnit.Day,
         }
         return TimeFrame(self.timeframe_amount, unit_map[self.timeframe_unit])
+
+    def timeframe_minutes(self) -> float:
+        minutes_per_unit = {"Minute": 1.0, "Hour": 60.0, "Day": 60.0 * 24.0}
+        return self.timeframe_amount * minutes_per_unit.get(self.timeframe_unit, 1.0)
 
     def label_horizon_bars(self) -> int:
         """
@@ -663,6 +748,10 @@ class FeatureEngineer:
         "mkt_return_5", "mkt_return_10",
         "rel_strength_5", "rel_strength_10",
         "mkt_atr_percentile",
+        "vwap_dev", "gap_from_prev_close", "return_since_open",
+        "sector_return_5", "sector_return_10",
+        "sector_rel_strength_5", "sector_rel_strength_10",
+        "sector_atr_percentile",
     ]
 
     def __init__(self, atr_percentile_window: int = 100):
@@ -787,13 +876,72 @@ class FeatureEngineer:
         except Exception:
             return neutral_ret, neutral_ret.copy(), neutral_pctile
 
-    def add_features(self, df: pd.DataFrame, market_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    @staticmethod
+    def _session_relative_features(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Computes VWAP deviation, gap-from-prior-session-close, and
+        return-since-session-open, all reset per trading day (day
+        boundaries derived from the bar index converted to America/New_York
+        -- Alpaca bar timestamps are UTC). A single bar's rolling-window
+        technical indicators can't express any of these since they need to
+        know where "today" started. Falls back to all-neutral (0.0) if the
+        index isn't tz-aware or the timezone database isn't available --
+        never raises, matching the same fail-safe pattern used for the
+        time-of-day feature.
+        """
+        index = df.index
+        neutral = pd.DataFrame(
+            {"vwap_dev": 0.0, "gap_from_prev_close": 0.0, "return_since_open": 0.0}, index=index
+        )
+        if not isinstance(index, pd.DatetimeIndex) or index.tz is None:
+            return neutral
+
+        try:
+            et_index = index.tz_convert("America/New_York")
+            day = pd.Series(et_index.date, index=index)
+
+            typical_price = (df["high"] + df["low"] + df["close"]) / 3.0
+            pv_cumsum = (typical_price * df["volume"]).groupby(day).cumsum()
+            vol_cumsum = df["volume"].groupby(day).cumsum().replace(0, np.nan)
+            vwap = pv_cumsum / vol_cumsum
+            vwap_dev = ((df["close"] - vwap) / vwap.replace(0, np.nan)).fillna(0.0)
+
+            session_open = df["open"].groupby(day).transform("first")
+            return_since_open = (
+                (df["close"] - session_open) / session_open.replace(0, np.nan)
+            ).fillna(0.0)
+
+            prev_close_by_day = df["close"].groupby(day).last().shift(1)
+            prev_close = day.map(prev_close_by_day)
+            gap_from_prev_close = (
+                (session_open - prev_close) / prev_close.replace(0, np.nan)
+            ).fillna(0.0)
+
+            return pd.DataFrame({
+                "vwap_dev": vwap_dev,
+                "gap_from_prev_close": gap_from_prev_close,
+                "return_since_open": return_since_open,
+            })
+        except Exception:
+            return neutral
+
+    def add_features(
+        self,
+        df: pd.DataFrame,
+        market_df: Optional[pd.DataFrame] = None,
+        session_features_enabled: bool = True,
+        sector_df: Optional[pd.DataFrame] = None,
+    ) -> pd.DataFrame:
         """Return a copy of df with all feature columns (and raw ATR) added.
         `market_df` (raw OHLCV bars for config.market_context_symbol, same
         timeframe) is optional -- pass it whenever available so the
         market-relative features aren't silently neutral; must be supplied
         consistently at both training and live-inference time or those
         features become a source of train/inference skew rather than signal.
+        `sector_df` (raw OHLCV bars for this symbol's mapped sector ETF, see
+        TradingConfig.sector_map) is the same idea one level more specific;
+        None for symbols with no sector mapping (index ETFs, etc.) is
+        expected and fine, not an error case.
         """
         if df.empty or len(df) < 30:
             return pd.DataFrame()
@@ -859,6 +1007,23 @@ class FeatureEngineer:
         out["mkt_atr_percentile"] = mkt_atr_pctile
         out["rel_strength_5"] = out["return_5"] - out["mkt_return_5"]
         out["rel_strength_10"] = out["return_10"] - out["mkt_return_10"]
+
+        sector_ret_5, sector_ret_10, sector_atr_pctile = self._market_context_series(out.index, sector_df)
+        out["sector_return_5"] = sector_ret_5
+        out["sector_return_10"] = sector_ret_10
+        out["sector_atr_percentile"] = sector_atr_pctile
+        out["sector_rel_strength_5"] = out["return_5"] - out["sector_return_5"]
+        out["sector_rel_strength_10"] = out["return_10"] - out["sector_return_10"]
+
+        if session_features_enabled:
+            session_feats = self._session_relative_features(out)
+        else:
+            session_feats = pd.DataFrame(
+                {"vwap_dev": 0.0, "gap_from_prev_close": 0.0, "return_since_open": 0.0}, index=out.index
+            )
+        out["vwap_dev"] = session_feats["vwap_dev"]
+        out["gap_from_prev_close"] = session_feats["gap_from_prev_close"]
+        out["return_since_open"] = session_feats["return_since_open"]
 
         out = out.replace([np.inf, -np.inf], np.nan)
         return out
@@ -928,8 +1093,14 @@ class FeatureEngineer:
         raw_bars: pd.DataFrame,
         config: "TradingConfig",
         market_df: Optional[pd.DataFrame] = None,
+        sector_df: Optional[pd.DataFrame] = None,
     ) -> pd.DataFrame:
-        feats = self.add_features(raw_bars, market_df=market_df)
+        feats = self.add_features(
+            raw_bars,
+            market_df=market_df,
+            session_features_enabled=config.session_features_enabled,
+            sector_df=sector_df,
+        )
         if feats.empty:
             return feats
         if config.triple_barrier_labeling:
@@ -1504,23 +1675,69 @@ class RiskManager:
             return True
         return False
 
+    def confidence_size_multiplier(self, confidence: float) -> float:
+        """
+        Scales linearly from confidence_sizing_min_multiplier (right at
+        min_prediction_confidence, the weakest signal SignalGenerator would
+        ever act on) up to confidence_sizing_max_multiplier (at/above
+        confidence_sizing_full_scale_at) -- puts more size behind
+        higher-conviction calls instead of treating every signal that
+        clears the threshold identically. Only meaningful when
+        confidence is an actually-calibrated probability (see
+        TradingConfig.probability_calibration_enabled); with an
+        uncalibrated model this just scales by an arbitrary raw score.
+        """
+        if not self.config.confidence_sizing_enabled:
+            return 1.0
+        lo_conf = self.config.min_prediction_confidence
+        hi_conf = self.config.confidence_sizing_full_scale_at
+        if hi_conf <= lo_conf:
+            return 1.0
+        frac = (confidence - lo_conf) / (hi_conf - lo_conf)
+        frac = min(max(frac, 0.0), 1.0)
+        lo_mult = self.config.confidence_sizing_min_multiplier
+        hi_mult = self.config.confidence_sizing_max_multiplier
+        return lo_mult + frac * (hi_mult - lo_mult)
+
     def position_size(
-        self, equity: float, price: float, atr: float, performance_multiplier: float = 1.0
+        self,
+        equity: float,
+        price: float,
+        atr: float,
+        performance_multiplier: float = 1.0,
+        confidence_multiplier: float = 1.0,
     ) -> int:
         """
         Risk `risk_per_trade_pct` of equity, where the per-share risk is
-        `stop_loss_atr_mult * atr`. Also cap notional exposure per symbol.
+        `stop_loss_atr_mult * atr`. Also cap notional exposure per symbol --
+        that notional cap is a hard ceiling applied AFTER the multipliers
+        below, so neither of them can push a position past
+        max_position_pct_of_equity.
 
         `performance_multiplier` (default 1.0 = neutral) scales the risked
         dollar amount based on the strategy's recent realized performance --
         see PerformanceAnalyzer.recent_performance_multiplier. It's clamped
         to config.adaptive_sizing_{min,max}_multiplier by the caller, so
         it's applied here without re-clamping.
+
+        `confidence_multiplier` (default 1.0 = neutral) scales it further
+        based on how confident this particular signal is -- see
+        confidence_size_multiplier. Also pre-clamped by the caller.
+
+        The two are multiplicative, so their PRODUCT is re-clamped to
+        config.max_combined_size_multiplier here -- each factor being
+        individually bounded doesn't stop them compounding past the
+        intended overall risk ceiling when both land near their max at
+        once (a strong recent streak AND a high-confidence signal is a
+        real, not just theoretical, case for them to coincide).
         """
         if price <= 0 or atr <= 0:
             return 0
 
-        dollars_at_risk = equity * self.config.risk_per_trade_pct * performance_multiplier
+        combined_multiplier = min(
+            performance_multiplier * confidence_multiplier, self.config.max_combined_size_multiplier
+        )
+        dollars_at_risk = equity * self.config.risk_per_trade_pct * combined_multiplier
         per_share_risk = self.config.stop_loss_atr_mult * atr
         if per_share_risk <= 0:
             return 0
@@ -2482,14 +2699,20 @@ class Backtester:
         return (1 + cost_frac) if buying else (1 - cost_frac)
 
     def run_symbol(
-        self, symbol: str, starting_equity: float = 100_000.0, market_df: Optional[pd.DataFrame] = None
+        self,
+        symbol: str,
+        starting_equity: float = 100_000.0,
+        market_df: Optional[pd.DataFrame] = None,
+        sector_df: Optional[pd.DataFrame] = None,
     ) -> Optional[Dict]:
         raw_bars = self.data_feed.fetch_bars(symbol)
         if raw_bars.empty:
             self.logger.warning(f"[{symbol}] no historical bars for backtest")
             return None
 
-        dataset = self.feature_engineer.build_dataset(raw_bars, self.config, market_df=market_df)
+        dataset = self.feature_engineer.build_dataset(
+            raw_bars, self.config, market_df=market_df, sector_df=sector_df
+        )
         if len(dataset) < self.config.min_bars_required:
             self.logger.warning(f"[{symbol}] not enough bars for a meaningful backtest")
             return None
@@ -2555,7 +2778,10 @@ class Backtester:
             if position is None:
                 signal = self.signal_generator.generate(symbol, model, row, daily_trend=None)
                 if signal.action in ("BUY", "SELL"):
-                    qty = self.risk_manager.position_size(equity, signal.price, signal.atr)
+                    confidence_multiplier = self.risk_manager.confidence_size_multiplier(signal.confidence)
+                    qty = self.risk_manager.position_size(
+                        equity, signal.price, signal.atr, confidence_multiplier=confidence_multiplier
+                    )
                     if qty > 0:
                         cost_mult = self._cost_multiplier(signal.action, is_entry=True)
                         entry_price = signal.price * cost_mult
@@ -2610,10 +2836,26 @@ class Backtester:
                     "features -- backtest will use neutral values for those features."
                 )
 
+        sector_bars_by_etf: Dict[str, pd.DataFrame] = {}
+        if self.config.sector_context_enabled:
+            needed_etfs = {
+                self.config.sector_map[s] for s in self.config.symbols if s in self.config.sector_map
+            }
+            for etf in needed_etfs:
+                bars = self.data_feed.fetch_bars(etf)
+                if bars.empty:
+                    self.logger.warning(
+                        f"[{etf}] no bars for sector-context features -- symbols mapped to "
+                        "it will use neutral values for those features."
+                    )
+                sector_bars_by_etf[etf] = bars
+
         results = []
         for symbol in self.config.symbols:
             self.logger.info(f"[{symbol}] running backtest...")
-            result = self.run_symbol(symbol, market_df=market_df)
+            sector_etf = self.config.sector_map.get(symbol)
+            sector_df = sector_bars_by_etf.get(sector_etf) if sector_etf else None
+            result = self.run_symbol(symbol, market_df=market_df, sector_df=sector_df)
             if result is not None:
                 results.append(result)
                 self.logger.info(
@@ -2676,8 +2918,19 @@ class TradingBot:
         # re-fetched per symbol
         self._market_bars_cache: Optional[Tuple[datetime, pd.DataFrame]] = None
 
+        # sector ETF ticker -> (last_fetched_at, bars), shared across every
+        # symbol mapped to that sector instead of re-fetched per symbol
+        self._sector_bars_cache: Dict[str, Tuple[datetime, pd.DataFrame]] = {}
+
         # symbol -> last-known has_edge() result, so we log only on transitions
         self._edge_state_cache: Dict[str, bool] = {}
+
+        # symbol -> approximate entry time, for the time-based exit. Best
+        # effort across a restart: a position observed open without a
+        # recorded entry time gets the clock started from when we first
+        # notice it rather than assumed stale, since we have no way to
+        # recover its real entry time from the Alpaca position object alone.
+        self._position_opened_at: Dict[str, datetime] = {}
 
         # cached adaptive sizing multiplier, refreshed on its own schedule
         self._performance_multiplier: float = 1.0
@@ -2775,6 +3028,57 @@ class TradingBot:
         self._market_bars_cache = (now, bars)
         return bars
 
+    def _get_sector_bars(self, symbol: str) -> Optional[pd.DataFrame]:
+        """
+        Cached fetch of `symbol`'s mapped sector ETF bars (see
+        TradingConfig.sector_map), keyed by ETF ticker so every symbol
+        sharing a sector (e.g. AAPL/MSFT/NVDA all -> XLK) reuses one fetch
+        per cycle instead of one each. Returns None (features degrade to
+        neutral) if the symbol has no sector mapping, the feature is
+        disabled, or the fetch fails -- never raises.
+        """
+        if not self.config.sector_context_enabled:
+            return None
+        sector_etf = self.config.sector_map.get(symbol)
+        if sector_etf is None:
+            return None
+        now = datetime.now(timezone.utc)
+        cached = self._sector_bars_cache.get(sector_etf)
+        if cached is not None:
+            fetched_at, bars = cached
+            if now - fetched_at < timedelta(minutes=self.config.sector_context_refresh_minutes):
+                return bars
+        bars = self.data_feed.fetch_bars(sector_etf)
+        self._sector_bars_cache[sector_etf] = (now, bars)
+        return bars
+
+    def _prefetch_bars(self, symbols: List[str]) -> Dict[str, pd.DataFrame]:
+        """
+        Fetches raw bars for `symbols` concurrently instead of one at a
+        time -- these are independent, read-only GET requests, so there's
+        no shared-state hazard in doing them in parallel. Everything
+        downstream (signal generation, sizing, order submission) still runs
+        fully sequentially per symbol in the caller's loop; this only
+        speeds up the data-gathering step ahead of it. A single symbol's
+        fetch failure logs and yields an empty DataFrame for that symbol
+        (handled the same way a sequential fetch failure already was)
+        rather than failing the whole batch.
+        """
+        if not symbols:
+            return {}
+        results: Dict[str, pd.DataFrame] = {}
+        max_workers = max(1, min(self.config.max_concurrent_bar_fetches, len(symbols)))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            future_to_symbol = {pool.submit(self.data_feed.fetch_bars, s): s for s in symbols}
+            for future in as_completed(future_to_symbol):
+                symbol = future_to_symbol[future]
+                try:
+                    results[symbol] = future.result()
+                except Exception as exc:
+                    self.logger.error(f"[{symbol}] concurrent bar fetch failed: {exc}")
+                    results[symbol] = pd.DataFrame()
+        return results
+
     def _model_has_edge(self, symbol: str, model: MLSignalModel) -> bool:
         """
         Wraps model.has_edge() with state-transition logging, so a symbol
@@ -2827,16 +3131,16 @@ class TradingBot:
         return multiplier
 
     # ------------------------------------------------------------- model
-    def _train_symbol(self, symbol: str) -> None:
+    def _train_symbol(self, symbol: str, raw_bars: pd.DataFrame) -> None:
         model = self.models[symbol]
-        raw_bars = self.data_feed.fetch_bars(symbol)
         if raw_bars.empty:
             self.logger.warning(f"[{symbol}] no bar data returned, skipping training")
             return
 
         market_df = self._get_market_context_bars()
+        sector_df = self._get_sector_bars(symbol)
         dataset = self.feature_engineer.build_dataset(
-            raw_bars, self.config, market_df=market_df
+            raw_bars, self.config, market_df=market_df, sector_df=sector_df
         )
         if dataset.empty:
             self.logger.warning(f"[{symbol}] feature dataset empty after cleaning, skipping training")
@@ -2845,14 +3149,17 @@ class TradingBot:
         model.train(dataset)
 
     def _maybe_retrain_all(self) -> None:
-        for symbol, model in self.models.items():
-            if model.needs_retrain():
-                self.logger.info(f"[{symbol}] retraining model...")
-                try:
-                    self._train_symbol(symbol)
-                except Exception as exc:
-                    self.logger.error(f"[{symbol}] training raised an exception: {exc}")
-                    self.logger.debug(traceback.format_exc())
+        symbols_due = [symbol for symbol, model in self.models.items() if model.needs_retrain()]
+        if not symbols_due:
+            return
+        prefetched = self._prefetch_bars(symbols_due)
+        for symbol in symbols_due:
+            self.logger.info(f"[{symbol}] retraining model...")
+            try:
+                self._train_symbol(symbol, prefetched.get(symbol, pd.DataFrame()))
+            except Exception as exc:
+                self.logger.error(f"[{symbol}] training raised an exception: {exc}")
+                self.logger.debug(traceback.format_exc())
 
     # ------------------------------------------------------------- core
     def _process_symbol(
@@ -2861,19 +3168,39 @@ class TradingBot:
         equity: float,
         open_positions: Dict[str, object],
         minutes_to_close: Optional[float],
+        raw_bars: pd.DataFrame,
     ) -> None:
         model = self.models[symbol]
         if model.pipeline is None:
             self.logger.info(f"[{symbol}] no trained model yet, skipping")
             return
 
-        raw_bars = self.data_feed.fetch_bars(symbol)
         if raw_bars.empty or len(raw_bars) < 30:
             self.logger.info(f"[{symbol}] insufficient bar data, skipping")
             return
 
+        latest_bar_time = raw_bars.index[-1]
+        if isinstance(latest_bar_time, pd.Timestamp) and latest_bar_time.tzinfo is not None:
+            staleness_minutes = (
+                datetime.now(timezone.utc) - latest_bar_time.to_pydatetime()
+            ).total_seconds() / 60.0
+            max_staleness = self.config.timeframe_minutes() * self.config.max_bar_staleness_multiplier
+            if staleness_minutes > max_staleness:
+                self.logger.warning(
+                    f"[{symbol}] latest bar is {staleness_minutes:.1f} min old "
+                    f"(> {max_staleness:.1f} min threshold) -- skipping this cycle, "
+                    "possible data feed lag"
+                )
+                return
+
         market_df = self._get_market_context_bars()
-        features = self.feature_engineer.add_features(raw_bars, market_df=market_df)
+        sector_df = self._get_sector_bars(symbol)
+        features = self.feature_engineer.add_features(
+            raw_bars,
+            market_df=market_df,
+            session_features_enabled=self.config.session_features_enabled,
+            sector_df=sector_df,
+        )
         if features.empty:
             return
         latest = features.iloc[-1]
@@ -2899,16 +3226,42 @@ class TradingBot:
         if already_in_position:
             position = open_positions[symbol]
             position_side = "BUY" if float(position.qty) > 0 else "SELL"
+
+            now = datetime.now(timezone.utc)
+            opened_at = self._position_opened_at.get(symbol)
+            if opened_at is None:
+                # First time we're seeing this open position (fresh entry
+                # this cycle, or a bot restart that lost in-memory state) --
+                # start the clock now rather than assuming it's stale.
+                opened_at = now
+                self._position_opened_at[symbol] = opened_at
+
             if signal.action != "FLAT" and signal.action != position_side:
                 self.logger.info(f"[{symbol}] model flipped against open position, closing")
                 self.executor.close_position(symbol)
                 self.trailing_stop_manager.reset(symbol)
                 self.scale_out_manager.reset(symbol)
-            else:
-                self.scale_out_manager.check_and_execute(
-                    symbol, signal.price, effective_stop_price=self.trailing_stop_manager.current_stop(symbol)
-                )
-                self.trailing_stop_manager.update(symbol, position, signal.price, signal.atr)
+                self._position_opened_at.pop(symbol, None)
+                return
+
+            if self.config.enable_time_based_exit:
+                bars_held = (now - opened_at).total_seconds() / 60.0 / self.config.timeframe_minutes()
+                if bars_held >= self.config.time_exit_max_hold_bars:
+                    self.logger.info(
+                        f"[{symbol}] time-based exit: held ~{bars_held:.1f} bars "
+                        f"(>= {self.config.time_exit_max_hold_bars}) without resolving via "
+                        "stop/take/model-flip, freeing the capital"
+                    )
+                    self.executor.close_position(symbol)
+                    self.trailing_stop_manager.reset(symbol)
+                    self.scale_out_manager.reset(symbol)
+                    self._position_opened_at.pop(symbol, None)
+                    return
+
+            self.scale_out_manager.check_and_execute(
+                symbol, signal.price, effective_stop_price=self.trailing_stop_manager.current_stop(symbol)
+            )
+            self.trailing_stop_manager.update(symbol, position, signal.price, signal.atr)
             return  # bracket order already manages stop/take on the resting order
 
         # --- No new entries if we're too close to the close ---
@@ -2929,8 +3282,13 @@ class TradingBot:
             return
 
         performance_multiplier = self._get_performance_multiplier()
+        confidence_multiplier = self.risk_manager.confidence_size_multiplier(signal.confidence)
         qty = self.risk_manager.position_size(
-            equity, signal.price, signal.atr, performance_multiplier=performance_multiplier
+            equity,
+            signal.price,
+            signal.atr,
+            performance_multiplier=performance_multiplier,
+            confidence_multiplier=confidence_multiplier,
         )
         if qty <= 0:
             return
@@ -2968,6 +3326,7 @@ class TradingBot:
         if order is not None or self.config.dry_run:
             order_id = str(order.id) if order is not None else ""
             self.journal.log_trade(signal, qty, stop_price, full_take_price, order_id=order_id)
+            self._position_opened_at[symbol] = datetime.now(timezone.utc)
 
         if self.config.enable_partial_scale_out and qty >= 2:
             _, near_take_price = self.risk_manager.stop_take_levels(
@@ -3052,6 +3411,9 @@ class TradingBot:
                 for tracked_symbol in self.scale_out_manager.tracked_symbols():
                     if tracked_symbol not in open_positions:
                         self.scale_out_manager.reset(tracked_symbol)
+                for tracked_symbol in list(self._position_opened_at.keys()):
+                    if tracked_symbol not in open_positions:
+                        self._position_opened_at.pop(tracked_symbol, None)
 
                 if (
                     minutes_to_close is not None
@@ -3062,9 +3424,13 @@ class TradingBot:
                     time.sleep(self.config.poll_interval_seconds)
                     continue
 
+                prefetched_bars = self._prefetch_bars(self.config.symbols)
                 for symbol in self.config.symbols:
                     try:
-                        self._process_symbol(symbol, equity, open_positions, minutes_to_close)
+                        self._process_symbol(
+                            symbol, equity, open_positions, minutes_to_close,
+                            prefetched_bars.get(symbol, pd.DataFrame()),
+                        )
                     except Exception as exc:
                         self.logger.error(f"[{symbol}] error while processing: {exc}")
                         self.logger.debug(traceback.format_exc())
