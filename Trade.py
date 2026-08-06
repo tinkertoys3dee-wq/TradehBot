@@ -136,6 +136,7 @@ import sys
 import time
 import traceback
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict, fields
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -443,6 +444,16 @@ class TradingConfig:
     poll_interval_seconds: int = 60
     entry_cutoff_minutes_before_close: int = 20  # stop opening new positions late in day
     flatten_before_close_minutes: int = 5        # close all positions before the bell
+
+    # --- Concurrency ------------------------------------------------------------
+    # Bar fetches are pure I/O (read-only GET requests) and independent per
+    # symbol, so they're fetched concurrently instead of one-at-a-time --
+    # with 21 symbols plus sector-context ETFs, sequential fetching was
+    # adding up. Bounded so a growing symbol universe doesn't open unbounded
+    # simultaneous connections to Alpaca. Order submission and every
+    # decision in _process_symbol stays fully sequential -- only the data-
+    # gathering step is concurrent.
+    max_concurrent_bar_fetches: int = 8
 
     # --- Bookkeeping --------------------------------------------------------
     model_dir: str = "models"
@@ -3041,6 +3052,33 @@ class TradingBot:
         self._sector_bars_cache[sector_etf] = (now, bars)
         return bars
 
+    def _prefetch_bars(self, symbols: List[str]) -> Dict[str, pd.DataFrame]:
+        """
+        Fetches raw bars for `symbols` concurrently instead of one at a
+        time -- these are independent, read-only GET requests, so there's
+        no shared-state hazard in doing them in parallel. Everything
+        downstream (signal generation, sizing, order submission) still runs
+        fully sequentially per symbol in the caller's loop; this only
+        speeds up the data-gathering step ahead of it. A single symbol's
+        fetch failure logs and yields an empty DataFrame for that symbol
+        (handled the same way a sequential fetch failure already was)
+        rather than failing the whole batch.
+        """
+        if not symbols:
+            return {}
+        results: Dict[str, pd.DataFrame] = {}
+        max_workers = max(1, min(self.config.max_concurrent_bar_fetches, len(symbols)))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            future_to_symbol = {pool.submit(self.data_feed.fetch_bars, s): s for s in symbols}
+            for future in as_completed(future_to_symbol):
+                symbol = future_to_symbol[future]
+                try:
+                    results[symbol] = future.result()
+                except Exception as exc:
+                    self.logger.error(f"[{symbol}] concurrent bar fetch failed: {exc}")
+                    results[symbol] = pd.DataFrame()
+        return results
+
     def _model_has_edge(self, symbol: str, model: MLSignalModel) -> bool:
         """
         Wraps model.has_edge() with state-transition logging, so a symbol
@@ -3093,9 +3131,8 @@ class TradingBot:
         return multiplier
 
     # ------------------------------------------------------------- model
-    def _train_symbol(self, symbol: str) -> None:
+    def _train_symbol(self, symbol: str, raw_bars: pd.DataFrame) -> None:
         model = self.models[symbol]
-        raw_bars = self.data_feed.fetch_bars(symbol)
         if raw_bars.empty:
             self.logger.warning(f"[{symbol}] no bar data returned, skipping training")
             return
@@ -3112,14 +3149,17 @@ class TradingBot:
         model.train(dataset)
 
     def _maybe_retrain_all(self) -> None:
-        for symbol, model in self.models.items():
-            if model.needs_retrain():
-                self.logger.info(f"[{symbol}] retraining model...")
-                try:
-                    self._train_symbol(symbol)
-                except Exception as exc:
-                    self.logger.error(f"[{symbol}] training raised an exception: {exc}")
-                    self.logger.debug(traceback.format_exc())
+        symbols_due = [symbol for symbol, model in self.models.items() if model.needs_retrain()]
+        if not symbols_due:
+            return
+        prefetched = self._prefetch_bars(symbols_due)
+        for symbol in symbols_due:
+            self.logger.info(f"[{symbol}] retraining model...")
+            try:
+                self._train_symbol(symbol, prefetched.get(symbol, pd.DataFrame()))
+            except Exception as exc:
+                self.logger.error(f"[{symbol}] training raised an exception: {exc}")
+                self.logger.debug(traceback.format_exc())
 
     # ------------------------------------------------------------- core
     def _process_symbol(
@@ -3128,13 +3168,13 @@ class TradingBot:
         equity: float,
         open_positions: Dict[str, object],
         minutes_to_close: Optional[float],
+        raw_bars: pd.DataFrame,
     ) -> None:
         model = self.models[symbol]
         if model.pipeline is None:
             self.logger.info(f"[{symbol}] no trained model yet, skipping")
             return
 
-        raw_bars = self.data_feed.fetch_bars(symbol)
         if raw_bars.empty or len(raw_bars) < 30:
             self.logger.info(f"[{symbol}] insufficient bar data, skipping")
             return
@@ -3384,9 +3424,13 @@ class TradingBot:
                     time.sleep(self.config.poll_interval_seconds)
                     continue
 
+                prefetched_bars = self._prefetch_bars(self.config.symbols)
                 for symbol in self.config.symbols:
                     try:
-                        self._process_symbol(symbol, equity, open_positions, minutes_to_close)
+                        self._process_symbol(
+                            symbol, equity, open_positions, minutes_to_close,
+                            prefetched_bars.get(symbol, pd.DataFrame()),
+                        )
                     except Exception as exc:
                         self.logger.error(f"[{symbol}] error while processing: {exc}")
                         self.logger.debug(traceback.format_exc())
