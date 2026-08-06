@@ -437,8 +437,20 @@ class TradingConfig:
     model_quality_min_avg_accuracy: float = 0.51  # below this, suspend NEW entries (existing positions still managed)
 
     # --- Entry order type (bounded-slippage limit entries) --------------------
-    entry_order_type: str = "market"        # "market" or "limit"
-    entry_limit_buffer_bps: float = 5.0     # for "limit": how far through the reference price to allow
+    # Switched to "limit" after live evidence on 2026-08-06: RBLX/MSFT/CVX
+    # all had entry attempts during fast-moving/gappy stretches where the
+    # reference price (last closed bar) was stale by the time the order
+    # reached Alpaca -- RBLX alone had 8 rejected re-entry attempts
+    # ("stop_loss.stop_price must be >= base_price + 0.01") while price ran
+    # away from its stop. Rejections are the safe case; a "market" entry
+    # that DOES fill during that same window can end up with a real
+    # risk-per-share wider than RiskManager sized for, since qty was
+    # computed from the stale price/ATR. A limit entry instead simply
+    # doesn't fill if price has already moved past entry_limit_buffer_bps --
+    # missing the trade beats taking on undersized-looking risk that's
+    # actually oversized.
+    entry_order_type: str = "limit"         # "market" or "limit"
+    entry_limit_buffer_bps: float = 5.0     # how far through the reference price to allow
 
     # --- Loop timing -----------------------------------------------------------
     poll_interval_seconds: int = 60
