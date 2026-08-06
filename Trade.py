@@ -213,7 +213,20 @@ class TradingConfig:
     paper: bool = True  # NEVER set False in this script. See TradingBot._safety_check.
 
     # --- Universe & bar settings ------------------------------------------
-    symbols: List[str] = field(default_factory=lambda: ["AAPL", "MSFT", "SPY", "QQQ", "NVDA","AMZN","META","TSLA","GRMN","CIBR"])
+    # Expanded beyond the original mega-cap-tech-heavy list so the bot has
+    # independent (less correlated) setups to trade across more sectors --
+    # the old list left correlation_group caps blocking most of the day
+    # once 1-2 mega-cap-tech names were in play, and everything else in it
+    # (SPY/QQQ, GRMN, CIBR) moves together with "risk on/off" sentiment.
+    symbols: List[str] = field(default_factory=lambda: [
+        "AAPL", "MSFT", "SPY", "QQQ", "NVDA", "AMZN", "META", "TSLA", "GRMN", "CIBR",
+        "GOOGL", "AMD",              # mega-cap tech / semis
+        "JPM", "BAC",                # financials
+        "UNH", "LLY",                # healthcare
+        "XOM", "CVX",                # energy
+        "CAT",                       # industrials
+        "HD", "COST",                # consumer retail
+    ])
     timeframe_amount: int = 15
     timeframe_unit: str = "Minute"       # "Minute", "Hour", "Day"
     lookback_days: int = 60              # history pulled for training/features
@@ -232,7 +245,11 @@ class TradingConfig:
     max_daily_loss_pct: float = 0.03     # halt all new trades after this drawdown
     stop_loss_atr_mult: float = 2.0
     take_profit_atr_mult: float = 3.0
-    trailing_stop: bool = False
+    # On by default: TrailingStopManager only ever tightens a resting stop
+    # (never loosens it), so this can only reduce give-back on winners --
+    # unlike partial scale-out, there's no failure mode where it leaves a
+    # position under-protected.
+    trailing_stop: bool = True
 
     # --- Multi-timeframe trend confirmation --------------------------------
     require_daily_trend_confirmation: bool = True
@@ -243,7 +260,11 @@ class TradingConfig:
     correlation_groups: Dict[str, List[str]] = field(
         default_factory=lambda: {
             "broad_market": ["SPY", "QQQ", "DIA", "IWM"],
-            "mega_cap_tech": ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META"],
+            "mega_cap_tech": ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "AMD"],
+            "financials": ["JPM", "BAC"],
+            "healthcare": ["UNH", "LLY"],
+            "energy": ["XOM", "CVX"],
+            "consumer_retail": ["HD", "COST"],
         }
     )
     max_positions_per_correlation_group: int = 2
