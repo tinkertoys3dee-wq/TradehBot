@@ -238,6 +238,7 @@ class TradingConfig:
         "XOM", "CVX",                # energy
         "CAT",                       # industrials
         "HD", "COST",                # consumer retail
+        "RBLX",                      # Volatile Stocks
     ])
     timeframe_amount: int = 15
     timeframe_unit: str = "Minute"       # "Minute", "Hour", "Day"
