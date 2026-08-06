@@ -225,24 +225,31 @@ class TradingConfig:
     paper: bool = True  # NEVER set False in this script. See TradingBot._safety_check.
 
     # --- Universe & bar settings ------------------------------------------
-    # Pruned on 2026-08-06 based on two backtests over the same ~60-day
-    # history (a single 30%-holdout split, then a 4-fold walk-forward).
-    # Dropped: CVX, CIBR, BAC, AMZN, SPY, JPM, LLY, META, CAT -- all lost
-    # money in BOTH tests (several with Sharpe -6 to -9 twice), the
-    # strongest evidence available so far of a persistent negative bias
-    # rather than noise. Kept everything else: symbols profitable in both
-    # tests (TSLA, AMD, HD, UNH, QQQ, XOM) plus symbols that flipped sign
-    # between the two runs (AAPL, NVDA, GOOGL, MSFT, COST, GRMN) -- a
-    # flip means the single-split result for those was likely noise, not
-    # that the symbol is bad, so they stay in rather than being cut on
-    # unproven grounds. Not proof either way (both tests draw from
-    # overlapping history, not genuinely different market regimes) --
-    # see chat history for the full comparison.
-    symbols: List[str] = field(default_factory=lambda: [
-        "TSLA", "AMD", "HD",              # consistently positive, strongest signal (Sharpe 4+ in both tests)
-        "UNH", "QQQ", "XOM",              # consistently positive, smaller magnitude
-        "AAPL", "NVDA", "GOOGL", "MSFT", "COST", "GRMN",  # flipped sign between tests -- unproven, not excluded
-    ])
+    # Pruned again on 2026-08-06 after a THIRD backtest -- this one a
+    # 4-fold walk-forward over 2 years of history (300+ trades for
+    # several symbols, vs. ~30-50 in the two earlier ~60-day tests).
+    # That's the first genuinely statistically meaningful test we've had,
+    # and it overturned half of the previous "consistent" group: HD, UNH,
+    # and QQQ all looked profitable across two overlapping ~60-day
+    # windows and turned out negative over 2 years -- proof that small
+    # samples were producing false positives, exactly the risk the longer
+    # backtest was built to catch.
+    #
+    # Only three symbols were profitable in ALL THREE independent tests
+    # (single-split, 60-day walk-forward, 2-year walk-forward): TSLA, AMD,
+    # XOM. Zero symbols were negative in all three -- everything else
+    # flipped sign at least once. NVDA was the closest call (positive in
+    # the two largest tests, negative only in the smallest) but still cut
+    # for consistency with the "prove it across every test" bar the rest
+    # of the universe was held to -- a symbol that's flipped sign before
+    # can flip again. See chat history for the full 3-way comparison.
+    #
+    # This is a real, explicit tradeoff against trading FREQUENCY (roughly
+    # 1-1.5 combined trades/day across these three vs. ~10/day with the
+    # broader universe) in favor of trading quality -- reflects the
+    # session's overall shift from "more trades" toward "trades with real
+    # evidence behind them."
+    symbols: List[str] = field(default_factory=lambda: ["TSLA", "AMD", "XOM"])
     timeframe_amount: int = 15
     timeframe_unit: str = "Minute"       # "Minute", "Hour", "Day"
     lookback_days: int = 60              # LIVE history window -- retrained every retrain_interval_minutes, doesn't need years of stale history
