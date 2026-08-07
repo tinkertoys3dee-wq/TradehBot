@@ -298,18 +298,35 @@ class TradingConfig:
     paper: bool = True  # NEVER set False in this script. See TradingBot._safety_check.
 
     # --- Universe & bar settings ------------------------------------------
-    # 2026-08-07: temporarily widened to a ~100-symbol broad screen (see
-    # BROAD_SCREEN_SECTOR_BUCKETS above) so a full --backtest run can
-    # gather evidence across every major sector at once, rather than
-    # hand-picking candidates to test one at a time. This is explicitly a
-    # SCREENING step -- the plan is to prune back down to only the symbols
-    # that prove out (same evidence-based approach as the prior
-    # TSLA/AMD/XOM pruning: profitable across multiple independent
-    # backtests, not just one), not to trade all ~100 of these live as-is.
-    # The proven core (TSLA, AMD, XOM) is included so its edge keeps
-    # getting re-validated against fresh backtest runs alongside everything
-    # else being screened.
-    symbols: List[str] = field(default_factory=_broad_screen_symbols)
+    # 2026-08-07: narrowed from the ~100-symbol broad screen (still defined
+    # above as BROAD_SCREEN_SECTOR_BUCKETS/_broad_screen_symbols for
+    # reference) down to the symbols that actually cleared a real bar in
+    # that screen: n_trades >= 100 (statistical weight), win_rate >= 0.44
+    # (above the ~breakeven line for this bot's 2:3 stop:take ratio),
+    # positive total_return AND positive Sharpe. That's 18 symbols:
+    # ORCL, ABNB, CMCSA, NVDA, SMCI, NFLX, BAC, TSLA, SLB, COIN, TXN, V,
+    # XOM, AAPL, MU, INTC, QCOM, NEE.
+    #
+    # Also included: RIVN and RBLX (Sharpe 2.6 and 1.9 respectively, but
+    # under the 100-trade bar -- likely don't have a full 2 years of
+    # history yet as newer IPOs, so flagged lower-confidence pending more
+    # data) and AMD (previously one of only three symbols profitable
+    # across three independent backtests, but flipped negative in THIS
+    # run -- a genuinely important finding, since it shows even the same
+    # 2-year walk-forward methodology has real run-to-run variance just
+    # from the date window shifting. Given one more round here rather
+    # than dropped on a single flip, since "proven" should mean "proven
+    # repeatedly.")
+    #
+    # This list is a CANDIDATE shortlist pending a confirming re-run, not
+    # a final answer -- the whole point of this round is to see which of
+    # these 21 hold up a second time before trusting any of them for live
+    # trading.
+    symbols: List[str] = field(default_factory=lambda: [
+        "ORCL", "ABNB", "CMCSA", "NVDA", "SMCI", "NFLX", "BAC", "TSLA",
+        "SLB", "COIN", "TXN", "V", "XOM", "AAPL", "MU", "INTC", "QCOM", "NEE",
+        "RIVN", "RBLX", "AMD",
+    ])
     timeframe_amount: int = 15
     timeframe_unit: str = "Minute"       # "Minute", "Hour", "Day"
     lookback_days: int = 60              # LIVE history window -- retrained every retrain_interval_minutes, doesn't need years of stale history
