@@ -514,7 +514,7 @@ class TradingConfig:
     # thrashing rather than a speedup. Raise this on a machine with many
     # cores and RAM to spare; 1 disables parallelism (sequential, same as
     # before this existed).
-    backtest_max_parallel_workers: int = 4
+    backtest_max_parallel_workers: int = 2
 
     # --- Adaptive, performance-based position sizing -------------------------
     adaptive_sizing_enabled: bool = True
