@@ -1,7 +1,7 @@
 """
 ================================================================================
 ALPACA ML INTRADAY TRADING BOT (PAPER TRADING ONLY)
-================================================================================
+===============================================================================
 
 A self-contained, single-file algorithmic trading system that:
 
@@ -136,7 +136,7 @@ import sys
 import time
 import traceback
 import warnings
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict, fields
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -226,38 +226,54 @@ BROAD_SCREEN_SECTOR_BUCKETS: Dict[str, Tuple[str, List[str]]] = {
     "tech_semis": ("XLK", [
         "AAPL", "MSFT", "NVDA", "AMD", "AVGO", "ORCL", "CRM", "ADBE",
         "INTC", "CSCO", "QCOM", "TXN", "NOW", "AMAT", "MU",
+        "PANW", "CRWD", "SNOW", "WDAY", "TEAM", "DDOG", "NET", "FTNT",
+        "KLAC", "LRCX", "MRVL", "ON", "SWKS", "MCHP", "ADI", "DELL", "ANET",
     ]),
     "communication_services": ("XLC", [
         "GOOGL", "META", "NFLX", "DIS", "CMCSA", "T", "VZ", "TMUS",
+        "WBD", "PARA", "SPOT", "PINS", "SNAP", "MTCH", "LYV",
     ]),
     "consumer_discretionary": ("XLY", [
         "AMZN", "TSLA", "HD", "MCD", "NKE", "SBUX", "LOW", "BKNG",
         "TJX", "MAR", "F", "ABNB",
+        "ROST", "ULTA", "DPZ", "YUM", "CCL", "NCLH", "DAL", "UAL", "AAL",
+        "LULU", "ETSY", "EBAY", "ORLY", "AZO",
     ]),
     "consumer_staples": ("XLP", [
         "WMT", "PG", "KO", "PEP", "COST", "PM", "MO", "CL",
+        "KHC", "GIS", "KMB", "STZ", "KR", "SYY", "HSY", "CAG",
     ]),
     "financials": ("XLF", [
         "JPM", "BAC", "WFC", "GS", "MS", "C", "SCHW", "AXP", "V", "MA",
+        "USB", "PNC", "TFC", "COF", "BK", "TROW", "CB", "MET", "PRU",
+        "ICE", "CME", "SPGI", "MCO",
     ]),
     "healthcare": ("XLV", [
         "UNH", "LLY", "JNJ", "ABBV", "MRK", "PFE", "TMO", "ABT",
         "DHR", "BMY", "AMGN", "GILD",
+        "CI", "HUM", "CNC", "ELV", "VRTX", "REGN", "ZTS", "BSX", "SYK",
+        "MDT", "BDX", "IDXX", "IQV", "MRNA", "BIIB",
     ]),
     "energy": ("XLE", [
         "XOM", "CVX", "COP", "SLB", "EOG", "MPC", "OXY",
+        "WMB", "KMI", "HAL", "DVN", "FANG", "HES", "BKR",
     ]),
     "industrials": ("XLI", [
         "CAT", "BA", "HON", "UPS", "RTX", "GE", "LMT", "DE",
+        "MMM", "EMR", "ETN", "ITW", "PH", "ROK", "CSX", "NSC", "FDX",
+        "WM", "GD", "NOC", "TDG",
     ]),
     "materials": ("XLB", [
         "LIN", "APD", "SHW", "ECL",
+        "FCX", "NUE", "DOW", "DD", "VMC", "MLM",
     ]),
     "utilities": ("XLU", [
         "NEE", "DUK",
+        "SO", "D", "EXC", "AEP", "XEL", "ED", "PEG", "WEC",
     ]),
     "real_estate": ("XLRE", [
         "PLD", "AMT",
+        "O", "SPG", "PSA", "WELL", "VTR", "AVB", "EQR", "DLR",
     ]),
     "broad_market": ("SPY", [
         "SPY", "QQQ", "DIA", "IWM",
@@ -267,7 +283,10 @@ BROAD_SCREEN_SECTOR_BUCKETS: Dict[str, Tuple[str, List[str]]] = {
 # single-sector-ETF mapping (or that ARE themselves a sector ETF, e.g.
 # CIBR) -- included in the universe but not in a correlation group, since
 # they aren't particularly correlated with each other.
-BROAD_SCREEN_UNGROUPED: List[str] = ["RBLX", "COIN", "PLTR", "SMCI", "SOFI", "RIVN", "GRMN", "CIBR"]
+BROAD_SCREEN_UNGROUPED: List[str] = [
+    "RBLX", "COIN", "PLTR", "SMCI", "SOFI", "RIVN", "GRMN", "CIBR",
+    "ARM", "DKNG", "U", "HOOD", "AFRM", "UPST", "CVNA", "DASH", "ROKU",
+]
 
 
 def _broad_screen_symbols() -> List[str]:
@@ -298,34 +317,26 @@ class TradingConfig:
     paper: bool = True  # NEVER set False in this script. See TradingBot._safety_check.
 
     # --- Universe & bar settings ------------------------------------------
-    # 2026-08-07: narrowed from the ~100-symbol broad screen (still defined
-    # above as BROAD_SCREEN_SECTOR_BUCKETS/_broad_screen_symbols for
-    # reference) down to the symbols that actually cleared a real bar in
-    # that screen: n_trades >= 100 (statistical weight), win_rate >= 0.44
-    # (above the ~breakeven line for this bot's 2:3 stop:take ratio),
-    # positive total_return AND positive Sharpe. That's 18 symbols:
-    # ORCL, ABNB, CMCSA, NVDA, SMCI, NFLX, BAC, TSLA, SLB, COIN, TXN, V,
-    # XOM, AAPL, MU, INTC, QCOM, NEE.
+    # 2026-08-07: confirmed via a SECOND consecutive 2-year walk-forward
+    # backtest on the 21-symbol shortlist. 16 of 21 were profitable in
+    # BOTH consecutive runs -- that's real, repeated evidence, not a
+    # one-off (each run draws from a slightly different date window since
+    # backtest_lookback_days counts back from "now"). Kept:
+    # ORCL, SMCI, COIN, RIVN, ABNB, SLB, TXN, NVDA, TSLA, RBLX, XOM,
+    # CMCSA, BAC, NEE, V, AAPL.
     #
-    # Also included: RIVN and RBLX (Sharpe 2.6 and 1.9 respectively, but
-    # under the 100-trade bar -- likely don't have a full 2 years of
-    # history yet as newer IPOs, so flagged lower-confidence pending more
-    # data) and AMD (previously one of only three symbols profitable
-    # across three independent backtests, but flipped negative in THIS
-    # run -- a genuinely important finding, since it shows even the same
-    # 2-year walk-forward methodology has real run-to-run variance just
-    # from the date window shifting. Given one more round here rather
-    # than dropped on a single flip, since "proven" should mean "proven
-    # repeatedly.")
+    # Dropped: AMD -- was one of only three symbols profitable across the
+    # first three backtests, but has now failed the last two consecutive
+    # runs. A real reversal, not noise: "proven" means proven repeatedly,
+    # and it stopped being that. Also dropped NFLX, INTC, QCOM, MU --
+    # none have shown a consistent direction across the tests run this
+    # session (positive once, negative once, or worse).
     #
-    # This list is a CANDIDATE shortlist pending a confirming re-run, not
-    # a final answer -- the whole point of this round is to see which of
-    # these 21 hold up a second time before trusting any of them for live
-    # trading.
+    # BROAD_SCREEN_SECTOR_BUCKETS/_broad_screen_symbols above stay defined
+    # for reference if the net needs widening again later.
     symbols: List[str] = field(default_factory=lambda: [
-        "ORCL", "ABNB", "CMCSA", "NVDA", "SMCI", "NFLX", "BAC", "TSLA",
-        "SLB", "COIN", "TXN", "V", "XOM", "AAPL", "MU", "INTC", "QCOM", "NEE",
-        "RIVN", "RBLX", "AMD",
+        "ORCL", "SMCI", "COIN", "RIVN", "ABNB", "SLB", "TXN", "NVDA",
+        "TSLA", "RBLX", "XOM", "CMCSA", "BAC", "NEE", "V", "AAPL",
     ])
     timeframe_amount: int = 15
     timeframe_unit: str = "Minute"       # "Minute", "Hour", "Day"
@@ -491,6 +502,19 @@ class TradingConfig:
     # instead of 1 per symbol). 0 or 1 falls back to the single-split
     # behavior.
     backtest_walkforward_folds: int = 4
+
+    # Runs each symbol's backtest in its own process instead of one at a
+    # time -- every symbol's backtest is fully independent (own model, own
+    # $100k, no shared state), so this is embarrassingly parallel across
+    # CPU cores with no loss of rigor (same folds, same lookback, same
+    # everything -- just concurrent instead of sequential). Default is
+    # conservative on purpose: RandomForestClassifier already uses all
+    # cores internally per fit (n_jobs=-1), so too many worker processes
+    # each spawning their own all-cores RF causes oversubscription/
+    # thrashing rather than a speedup. Raise this on a machine with many
+    # cores and RAM to spare; 1 disables parallelism (sequential, same as
+    # before this existed).
+    backtest_max_parallel_workers: int = 4
 
     # --- Adaptive, performance-based position sizing -------------------------
     adaptive_sizing_enabled: bool = True
@@ -2885,6 +2909,45 @@ class PerformanceAnalyzer:
 # 9.7 BACKTESTING ENGINE (offline, no live orders)
 # ==============================================================================
 
+def _run_symbol_backtest_worker(
+    config: "TradingConfig",
+    symbol: str,
+    market_df: Optional[pd.DataFrame],
+    sector_df: Optional[pd.DataFrame],
+    use_walkforward: bool,
+) -> Optional[Dict]:
+    """
+    Module-level (not a Backtester method) so it's picklable for
+    ProcessPoolExecutor -- builds its own TradingClient/AlpacaDataFeed/
+    Backtester inside the worker process rather than sharing the
+    parent's, since live API client objects generally don't survive
+    being pickled across a process boundary cleanly. `config`,
+    `market_df`, and `sector_df` are plain dataclass/DataFrame data, so
+    those pickle fine and are the only things that need to cross the
+    boundary.
+
+    Logs to a null handler (console-silent) rather than the shared log
+    file -- multiple processes writing to the same FileHandler
+    concurrently risks interleaved/corrupted lines. The parent process
+    logs each symbol's one-line summary once its result comes back, so
+    progress is still visible, just per-symbol-on-completion rather than
+    per-fold-in-progress.
+    """
+    worker_logger = logging.getLogger(f"alpaca_ml_bot.backtest_worker.{symbol}")
+    worker_logger.setLevel(logging.WARNING)
+    if not worker_logger.handlers:
+        worker_logger.addHandler(logging.NullHandler())
+
+    trading_client = TradingClient(config.api_key, config.secret_key, paper=True)
+    data_feed = AlpacaDataFeed(config, trading_client, worker_logger)
+    feature_engineer = FeatureEngineer(atr_percentile_window=config.atr_percentile_window)
+    bt = Backtester(config, data_feed, feature_engineer, worker_logger)
+
+    if use_walkforward:
+        return bt.run_symbol_walkforward(symbol, market_df=market_df, sector_df=sector_df)
+    return bt.run_symbol(symbol, market_df=market_df, sector_df=sector_df)
+
+
 class Backtester:
     """
     Runs the same feature/model/signal/risk logic against historical bars
@@ -3225,23 +3288,56 @@ class Backtester:
 
         use_walkforward = self.config.backtest_walkforward_folds >= 2
         results = []
-        for symbol in self.config.symbols:
-            self.logger.info(f"[{symbol}] running {'walk-forward ' if use_walkforward else ''}backtest...")
-            sector_etf = self.config.sector_map.get(symbol)
-            sector_df = sector_bars_by_etf.get(sector_etf) if sector_etf else None
-            if use_walkforward:
-                result = self.run_symbol_walkforward(symbol, market_df=market_df, sector_df=sector_df)
-            else:
-                result = self.run_symbol(symbol, market_df=market_df, sector_df=sector_df)
-            if result is not None:
-                results.append(result)
-                self.logger.info(
-                    f"[{symbol}] backtest: folds={result.get('n_folds', 1)} trades={result['n_trades']} "
-                    f"win_rate={result['win_rate']:.2%} "
-                    f"return={result['total_return']:.2%} "
-                    f"max_dd={result['max_drawdown']:.2%} "
-                    f"sharpe~={result['sharpe_approx']:.2f}"
-                )
+        n_workers = max(1, self.config.backtest_max_parallel_workers)
+
+        def _log_result(symbol: str, result: Optional[Dict]) -> None:
+            if result is None:
+                return
+            results.append(result)
+            self.logger.info(
+                f"[{symbol}] backtest: folds={result.get('n_folds', 1)} trades={result['n_trades']} "
+                f"win_rate={result['win_rate']:.2%} "
+                f"return={result['total_return']:.2%} "
+                f"max_dd={result['max_drawdown']:.2%} "
+                f"sharpe~={result['sharpe_approx']:.2f}"
+            )
+
+        if n_workers <= 1:
+            for symbol in self.config.symbols:
+                self.logger.info(f"[{symbol}] running {'walk-forward ' if use_walkforward else ''}backtest...")
+                sector_etf = self.config.sector_map.get(symbol)
+                sector_df = sector_bars_by_etf.get(sector_etf) if sector_etf else None
+                if use_walkforward:
+                    result = self.run_symbol_walkforward(symbol, market_df=market_df, sector_df=sector_df)
+                else:
+                    result = self.run_symbol(symbol, market_df=market_df, sector_df=sector_df)
+                _log_result(symbol, result)
+        else:
+            self.logger.info(
+                f"Running backtest for {len(self.config.symbols)} symbols across "
+                f"{n_workers} parallel worker processes..."
+            )
+            with ProcessPoolExecutor(max_workers=n_workers) as pool:
+                future_to_symbol = {}
+                for symbol in self.config.symbols:
+                    sector_etf = self.config.sector_map.get(symbol)
+                    sector_df = sector_bars_by_etf.get(sector_etf) if sector_etf else None
+                    future = pool.submit(
+                        _run_symbol_backtest_worker, self.config, symbol, market_df, sector_df, use_walkforward
+                    )
+                    future_to_symbol[future] = symbol
+                completed = 0
+                for future in as_completed(future_to_symbol):
+                    symbol = future_to_symbol[future]
+                    completed += 1
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        self.logger.error(f"[{symbol}] backtest worker raised an exception: {exc}")
+                        result = None
+                    self.logger.info(f"[{completed}/{len(self.config.symbols)}] done: {symbol}")
+                    _log_result(symbol, result)
+
         results_df = pd.DataFrame(results)
         if not results_df.empty:
             out_dir = Path(self.config.log_dir)
