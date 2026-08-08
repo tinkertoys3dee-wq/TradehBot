@@ -136,7 +136,7 @@ import sys
 import time
 import traceback
 import warnings
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict, fields
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -502,19 +502,6 @@ class TradingConfig:
     # instead of 1 per symbol). 0 or 1 falls back to the single-split
     # behavior.
     backtest_walkforward_folds: int = 4
-
-    # Runs each symbol's backtest in its own process instead of one at a
-    # time -- every symbol's backtest is fully independent (own model, own
-    # $100k, no shared state), so this is embarrassingly parallel across
-    # CPU cores with no loss of rigor (same folds, same lookback, same
-    # everything -- just concurrent instead of sequential). Default is
-    # conservative on purpose: RandomForestClassifier already uses all
-    # cores internally per fit (n_jobs=-1), so too many worker processes
-    # each spawning their own all-cores RF causes oversubscription/
-    # thrashing rather than a speedup. Raise this on a machine with many
-    # cores and RAM to spare; 1 disables parallelism (sequential, same as
-    # before this existed).
-    backtest_max_parallel_workers: int = 2
 
     # --- Adaptive, performance-based position sizing -------------------------
     adaptive_sizing_enabled: bool = True
@@ -2909,45 +2896,6 @@ class PerformanceAnalyzer:
 # 9.7 BACKTESTING ENGINE (offline, no live orders)
 # ==============================================================================
 
-def _run_symbol_backtest_worker(
-    config: "TradingConfig",
-    symbol: str,
-    market_df: Optional[pd.DataFrame],
-    sector_df: Optional[pd.DataFrame],
-    use_walkforward: bool,
-) -> Optional[Dict]:
-    """
-    Module-level (not a Backtester method) so it's picklable for
-    ProcessPoolExecutor -- builds its own TradingClient/AlpacaDataFeed/
-    Backtester inside the worker process rather than sharing the
-    parent's, since live API client objects generally don't survive
-    being pickled across a process boundary cleanly. `config`,
-    `market_df`, and `sector_df` are plain dataclass/DataFrame data, so
-    those pickle fine and are the only things that need to cross the
-    boundary.
-
-    Logs to a null handler (console-silent) rather than the shared log
-    file -- multiple processes writing to the same FileHandler
-    concurrently risks interleaved/corrupted lines. The parent process
-    logs each symbol's one-line summary once its result comes back, so
-    progress is still visible, just per-symbol-on-completion rather than
-    per-fold-in-progress.
-    """
-    worker_logger = logging.getLogger(f"alpaca_ml_bot.backtest_worker.{symbol}")
-    worker_logger.setLevel(logging.WARNING)
-    if not worker_logger.handlers:
-        worker_logger.addHandler(logging.NullHandler())
-
-    trading_client = TradingClient(config.api_key, config.secret_key, paper=True)
-    data_feed = AlpacaDataFeed(config, trading_client, worker_logger)
-    feature_engineer = FeatureEngineer(atr_percentile_window=config.atr_percentile_window)
-    bt = Backtester(config, data_feed, feature_engineer, worker_logger)
-
-    if use_walkforward:
-        return bt.run_symbol_walkforward(symbol, market_df=market_df, sector_df=sector_df)
-    return bt.run_symbol(symbol, market_df=market_df, sector_df=sector_df)
-
-
 class Backtester:
     """
     Runs the same feature/model/signal/risk logic against historical bars
@@ -3288,56 +3236,23 @@ class Backtester:
 
         use_walkforward = self.config.backtest_walkforward_folds >= 2
         results = []
-        n_workers = max(1, self.config.backtest_max_parallel_workers)
-
-        def _log_result(symbol: str, result: Optional[Dict]) -> None:
-            if result is None:
-                return
-            results.append(result)
-            self.logger.info(
-                f"[{symbol}] backtest: folds={result.get('n_folds', 1)} trades={result['n_trades']} "
-                f"win_rate={result['win_rate']:.2%} "
-                f"return={result['total_return']:.2%} "
-                f"max_dd={result['max_drawdown']:.2%} "
-                f"sharpe~={result['sharpe_approx']:.2f}"
-            )
-
-        if n_workers <= 1:
-            for symbol in self.config.symbols:
-                self.logger.info(f"[{symbol}] running {'walk-forward ' if use_walkforward else ''}backtest...")
-                sector_etf = self.config.sector_map.get(symbol)
-                sector_df = sector_bars_by_etf.get(sector_etf) if sector_etf else None
-                if use_walkforward:
-                    result = self.run_symbol_walkforward(symbol, market_df=market_df, sector_df=sector_df)
-                else:
-                    result = self.run_symbol(symbol, market_df=market_df, sector_df=sector_df)
-                _log_result(symbol, result)
-        else:
-            self.logger.info(
-                f"Running backtest for {len(self.config.symbols)} symbols across "
-                f"{n_workers} parallel worker processes..."
-            )
-            with ProcessPoolExecutor(max_workers=n_workers) as pool:
-                future_to_symbol = {}
-                for symbol in self.config.symbols:
-                    sector_etf = self.config.sector_map.get(symbol)
-                    sector_df = sector_bars_by_etf.get(sector_etf) if sector_etf else None
-                    future = pool.submit(
-                        _run_symbol_backtest_worker, self.config, symbol, market_df, sector_df, use_walkforward
-                    )
-                    future_to_symbol[future] = symbol
-                completed = 0
-                for future in as_completed(future_to_symbol):
-                    symbol = future_to_symbol[future]
-                    completed += 1
-                    try:
-                        result = future.result()
-                    except Exception as exc:
-                        self.logger.error(f"[{symbol}] backtest worker raised an exception: {exc}")
-                        result = None
-                    self.logger.info(f"[{completed}/{len(self.config.symbols)}] done: {symbol}")
-                    _log_result(symbol, result)
-
+        for symbol in self.config.symbols:
+            self.logger.info(f"[{symbol}] running {'walk-forward ' if use_walkforward else ''}backtest...")
+            sector_etf = self.config.sector_map.get(symbol)
+            sector_df = sector_bars_by_etf.get(sector_etf) if sector_etf else None
+            if use_walkforward:
+                result = self.run_symbol_walkforward(symbol, market_df=market_df, sector_df=sector_df)
+            else:
+                result = self.run_symbol(symbol, market_df=market_df, sector_df=sector_df)
+            if result is not None:
+                results.append(result)
+                self.logger.info(
+                    f"[{symbol}] backtest: folds={result.get('n_folds', 1)} trades={result['n_trades']} "
+                    f"win_rate={result['win_rate']:.2%} "
+                    f"return={result['total_return']:.2%} "
+                    f"max_dd={result['max_drawdown']:.2%} "
+                    f"sharpe~={result['sharpe_approx']:.2f}"
+                )
         results_df = pd.DataFrame(results)
         if not results_df.empty:
             out_dir = Path(self.config.log_dir)
