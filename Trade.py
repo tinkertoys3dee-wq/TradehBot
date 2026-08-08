@@ -298,34 +298,26 @@ class TradingConfig:
     paper: bool = True  # NEVER set False in this script. See TradingBot._safety_check.
 
     # --- Universe & bar settings ------------------------------------------
-    # 2026-08-07: narrowed from the ~100-symbol broad screen (still defined
-    # above as BROAD_SCREEN_SECTOR_BUCKETS/_broad_screen_symbols for
-    # reference) down to the symbols that actually cleared a real bar in
-    # that screen: n_trades >= 100 (statistical weight), win_rate >= 0.44
-    # (above the ~breakeven line for this bot's 2:3 stop:take ratio),
-    # positive total_return AND positive Sharpe. That's 18 symbols:
-    # ORCL, ABNB, CMCSA, NVDA, SMCI, NFLX, BAC, TSLA, SLB, COIN, TXN, V,
-    # XOM, AAPL, MU, INTC, QCOM, NEE.
+    # 2026-08-07: confirmed via a SECOND consecutive 2-year walk-forward
+    # backtest on the 21-symbol shortlist. 16 of 21 were profitable in
+    # BOTH consecutive runs -- that's real, repeated evidence, not a
+    # one-off (each run draws from a slightly different date window since
+    # backtest_lookback_days counts back from "now"). Kept:
+    # ORCL, SMCI, COIN, RIVN, ABNB, SLB, TXN, NVDA, TSLA, RBLX, XOM,
+    # CMCSA, BAC, NEE, V, AAPL.
     #
-    # Also included: RIVN and RBLX (Sharpe 2.6 and 1.9 respectively, but
-    # under the 100-trade bar -- likely don't have a full 2 years of
-    # history yet as newer IPOs, so flagged lower-confidence pending more
-    # data) and AMD (previously one of only three symbols profitable
-    # across three independent backtests, but flipped negative in THIS
-    # run -- a genuinely important finding, since it shows even the same
-    # 2-year walk-forward methodology has real run-to-run variance just
-    # from the date window shifting. Given one more round here rather
-    # than dropped on a single flip, since "proven" should mean "proven
-    # repeatedly.")
+    # Dropped: AMD -- was one of only three symbols profitable across the
+    # first three backtests, but has now failed the last two consecutive
+    # runs. A real reversal, not noise: "proven" means proven repeatedly,
+    # and it stopped being that. Also dropped NFLX, INTC, QCOM, MU --
+    # none have shown a consistent direction across the tests run this
+    # session (positive once, negative once, or worse).
     #
-    # This list is a CANDIDATE shortlist pending a confirming re-run, not
-    # a final answer -- the whole point of this round is to see which of
-    # these 21 hold up a second time before trusting any of them for live
-    # trading.
+    # BROAD_SCREEN_SECTOR_BUCKETS/_broad_screen_symbols above stay defined
+    # for reference if the net needs widening again later.
     symbols: List[str] = field(default_factory=lambda: [
-        "ORCL", "ABNB", "CMCSA", "NVDA", "SMCI", "NFLX", "BAC", "TSLA",
-        "SLB", "COIN", "TXN", "V", "XOM", "AAPL", "MU", "INTC", "QCOM", "NEE",
-        "RIVN", "RBLX", "AMD",
+        "ORCL", "SMCI", "COIN", "RIVN", "ABNB", "SLB", "TXN", "NVDA",
+        "TSLA", "RBLX", "XOM", "CMCSA", "BAC", "NEE", "V", "AAPL",
     ])
     timeframe_amount: int = 15
     timeframe_unit: str = "Minute"       # "Minute", "Hour", "Day"
