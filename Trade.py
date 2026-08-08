@@ -226,38 +226,54 @@ BROAD_SCREEN_SECTOR_BUCKETS: Dict[str, Tuple[str, List[str]]] = {
     "tech_semis": ("XLK", [
         "AAPL", "MSFT", "NVDA", "AMD", "AVGO", "ORCL", "CRM", "ADBE",
         "INTC", "CSCO", "QCOM", "TXN", "NOW", "AMAT", "MU",
+        "PANW", "CRWD", "SNOW", "WDAY", "TEAM", "DDOG", "NET", "FTNT",
+        "KLAC", "LRCX", "MRVL", "ON", "SWKS", "MCHP", "ADI", "DELL", "ANET",
     ]),
     "communication_services": ("XLC", [
         "GOOGL", "META", "NFLX", "DIS", "CMCSA", "T", "VZ", "TMUS",
+        "WBD", "PARA", "SPOT", "PINS", "SNAP", "MTCH", "LYV",
     ]),
     "consumer_discretionary": ("XLY", [
         "AMZN", "TSLA", "HD", "MCD", "NKE", "SBUX", "LOW", "BKNG",
         "TJX", "MAR", "F", "ABNB",
+        "ROST", "ULTA", "DPZ", "YUM", "CCL", "NCLH", "DAL", "UAL", "AAL",
+        "LULU", "ETSY", "EBAY", "ORLY", "AZO",
     ]),
     "consumer_staples": ("XLP", [
         "WMT", "PG", "KO", "PEP", "COST", "PM", "MO", "CL",
+        "KHC", "GIS", "KMB", "STZ", "KR", "SYY", "HSY", "CAG",
     ]),
     "financials": ("XLF", [
         "JPM", "BAC", "WFC", "GS", "MS", "C", "SCHW", "AXP", "V", "MA",
+        "USB", "PNC", "TFC", "COF", "BK", "TROW", "CB", "MET", "PRU",
+        "ICE", "CME", "SPGI", "MCO",
     ]),
     "healthcare": ("XLV", [
         "UNH", "LLY", "JNJ", "ABBV", "MRK", "PFE", "TMO", "ABT",
         "DHR", "BMY", "AMGN", "GILD",
+        "CI", "HUM", "CNC", "ELV", "VRTX", "REGN", "ZTS", "BSX", "SYK",
+        "MDT", "BDX", "IDXX", "IQV", "MRNA", "BIIB",
     ]),
     "energy": ("XLE", [
         "XOM", "CVX", "COP", "SLB", "EOG", "MPC", "OXY",
+        "WMB", "KMI", "HAL", "DVN", "FANG", "HES", "BKR",
     ]),
     "industrials": ("XLI", [
         "CAT", "BA", "HON", "UPS", "RTX", "GE", "LMT", "DE",
+        "MMM", "EMR", "ETN", "ITW", "PH", "ROK", "CSX", "NSC", "FDX",
+        "WM", "GD", "NOC", "TDG",
     ]),
     "materials": ("XLB", [
         "LIN", "APD", "SHW", "ECL",
+        "FCX", "NUE", "DOW", "DD", "VMC", "MLM",
     ]),
     "utilities": ("XLU", [
         "NEE", "DUK",
+        "SO", "D", "EXC", "AEP", "XEL", "ED", "PEG", "WEC",
     ]),
     "real_estate": ("XLRE", [
         "PLD", "AMT",
+        "O", "SPG", "PSA", "WELL", "VTR", "AVB", "EQR", "DLR",
     ]),
     "broad_market": ("SPY", [
         "SPY", "QQQ", "DIA", "IWM",
@@ -267,7 +283,10 @@ BROAD_SCREEN_SECTOR_BUCKETS: Dict[str, Tuple[str, List[str]]] = {
 # single-sector-ETF mapping (or that ARE themselves a sector ETF, e.g.
 # CIBR) -- included in the universe but not in a correlation group, since
 # they aren't particularly correlated with each other.
-BROAD_SCREEN_UNGROUPED: List[str] = ["RBLX", "COIN", "PLTR", "SMCI", "SOFI", "RIVN", "GRMN", "CIBR"]
+BROAD_SCREEN_UNGROUPED: List[str] = [
+    "RBLX", "COIN", "PLTR", "SMCI", "SOFI", "RIVN", "GRMN", "CIBR",
+    "ARM", "DKNG", "U", "HOOD", "AFRM", "UPST", "CVNA", "DASH", "ROKU",
+]
 
 
 def _broad_screen_symbols() -> List[str]:
