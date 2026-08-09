@@ -288,6 +288,24 @@ BROAD_SCREEN_UNGROUPED: List[str] = [
     "ARM", "DKNG", "U", "HOOD", "AFRM", "UPST", "CVNA", "DASH", "ROKU",
 ]
 
+# 2026-08-09: first pass of this 225-symbol screen (via --backtest
+# --config broad_screen_v2.json) is in. Of the 209 symbols not already
+# in the live 16 (see TradingConfig.symbols above), 27 cleared a real
+# bar and are written to broad_screen_v3_candidates.json as a shortlist
+# pending a confirming re-run (same two-consecutive-run standard used to
+# arrive at the live 16 -- one good run is not enough to trust):
+#   - 20 cleared n_trades>=100, win_rate>=0.44 (this bot's ~breakeven for
+#     its 2:3 stop:take ratio), positive return AND Sharpe: CCL, PINS,
+#     AMAT, SOFI, DD, KMI, IQV, EMR, CAG, FTNT, MRVL, USB, QCOM, ARM,
+#     BKNG, INTC, ZTS, CSX, ADI, TEAM.
+#   - 7 more flagged despite under the 100-trade bar because Sharpe was
+#     too strong to ignore (>=1.5, return >1.5%) -- same lower-confidence
+#     "one more look" treatment RIVN/RBLX got before graduating: APD,
+#     LYV, PH, PARA, FDX, WELL, TROW.
+# Next step: python Trade.py --backtest --config
+# broad_screen_v3_candidates.json, then fold whatever confirms a second
+# time into TradingConfig.symbols.
+
 
 def _broad_screen_symbols() -> List[str]:
     symbols = [s for _, members in BROAD_SCREEN_SECTOR_BUCKETS.values() for s in members]
@@ -317,20 +335,22 @@ class TradingConfig:
     paper: bool = True  # NEVER set False in this script. See TradingBot._safety_check.
 
     # --- Universe & bar settings ------------------------------------------
-    # 2026-08-07: confirmed via a SECOND consecutive 2-year walk-forward
-    # backtest on the 21-symbol shortlist. 16 of 21 were profitable in
-    # BOTH consecutive runs -- that's real, repeated evidence, not a
-    # one-off (each run draws from a slightly different date window since
-    # backtest_lookback_days counts back from "now"). Kept:
+    # 2026-08-09: re-confirmed via a THIRD independent 2-year walk-forward
+    # backtest -- this one incidentally run as part of screening the
+    # 225-symbol broad_screen_v2.json universe (broad_screen_v2.json
+    # includes all 16 of these, so their results in that run double as
+    # another confirmation of this live set without a separate pass).
+    # 15 of 16 positive again. Kept as-is:
     # ORCL, SMCI, COIN, RIVN, ABNB, SLB, TXN, NVDA, TSLA, RBLX, XOM,
     # CMCSA, BAC, NEE, V, AAPL.
     #
-    # Dropped: AMD -- was one of only three symbols profitable across the
-    # first three backtests, but has now failed the last two consecutive
-    # runs. A real reversal, not noise: "proven" means proven repeatedly,
-    # and it stopped being that. Also dropped NFLX, INTC, QCOM, MU --
-    # none have shown a consistent direction across the tests run this
-    # session (positive once, negative once, or worse).
+    # AAPL flipped negative this run (-1.1%, was positive in both prior
+    # runs) -- noted, not dropped. Same standard applied to AMD earlier:
+    # one flip after two clean confirmations is exactly the kind of
+    # run-to-run variance the walk-forward methodology expects, not proof
+    # of a broken edge. AMD was dropped only after failing two consecutive
+    # runs; AAPL is at one. Watching it -- a second consecutive negative
+    # run would be the same real reversal AMD showed and should drop it.
     #
     # BROAD_SCREEN_SECTOR_BUCKETS/_broad_screen_symbols above stay defined
     # for reference if the net needs widening again later.
