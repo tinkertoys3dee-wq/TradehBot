@@ -335,16 +335,16 @@ class TradingConfig:
     paper: bool = True  # NEVER set False in this script. See TradingBot._safety_check.
 
     # --- Universe & bar settings ------------------------------------------
-    # 2026-08-09: re-confirmed via a THIRD independent 2-year walk-forward
-    # backtest -- this one incidentally run as part of screening the
-    # 225-symbol broad_screen_v2.json universe (broad_screen_v2.json
-    # includes all 16 of these, so their results in that run double as
-    # another confirmation of this live set without a separate pass).
-    # 15 of 16 positive again. Kept as-is:
+    # 2026-08-09: original 16 re-confirmed via a THIRD independent 2-year
+    # walk-forward backtest -- this one incidentally run as part of
+    # screening the 225-symbol broad_screen_v2.json universe
+    # (broad_screen_v2.json includes all 16 of these, so their results in
+    # that run double as another confirmation of this live set without a
+    # separate pass). 15 of 16 positive again. Kept as-is:
     # ORCL, SMCI, COIN, RIVN, ABNB, SLB, TXN, NVDA, TSLA, RBLX, XOM,
     # CMCSA, BAC, NEE, V, AAPL.
     #
-    # AAPL flipped negative this run (-1.1%, was positive in both prior
+    # AAPL flipped negative that run (-1.1%, was positive in both prior
     # runs) -- noted, not dropped. Same standard applied to AMD earlier:
     # one flip after two clean confirmations is exactly the kind of
     # run-to-run variance the walk-forward methodology expects, not proof
@@ -352,11 +352,29 @@ class TradingConfig:
     # runs; AAPL is at one. Watching it -- a second consecutive negative
     # run would be the same real reversal AMD showed and should drop it.
     #
+    # 2026-08-09 (same day, second update): the 27 candidates in
+    # broad_screen_v3_candidates.json got their confirming re-run. 18 of
+    # 27 were profitable in BOTH that screen and the confirming run --
+    # real, repeated evidence by the same bar the original 16 were held
+    # to, so they graduate into the live set below:
+    # CCL, PINS, SOFI, DD, KMI, IQV, EMR, CAG, USB, ARM, ADI, APD, LYV,
+    # PH, PARA, FDX, WELL, TROW.
+    # ADI and ARM are the weakest of the 18 (barely positive in round 1:
+    # +0.16%/+1.05%) but cleared both rounds cleanly on the same
+    # both-positive standard as everything else here -- kept in, flagged
+    # as the ones most likely to be the next AAPL-style watch case.
+    #
+    # Failed to reconfirm (positive once, negative the second time --
+    # dropped, not carried forward): QCOM, ZTS, BKNG, CSX, MRVL, FTNT,
+    # TEAM, AMAT, INTC.
+    #
     # BROAD_SCREEN_SECTOR_BUCKETS/_broad_screen_symbols above stay defined
     # for reference if the net needs widening again later.
     symbols: List[str] = field(default_factory=lambda: [
         "ORCL", "SMCI", "COIN", "RIVN", "ABNB", "SLB", "TXN", "NVDA",
         "TSLA", "RBLX", "XOM", "CMCSA", "BAC", "NEE", "V", "AAPL",
+        "CCL", "PINS", "SOFI", "DD", "KMI", "IQV", "EMR", "CAG", "USB",
+        "ARM", "ADI", "APD", "LYV", "PH", "PARA", "FDX", "WELL", "TROW",
     ])
     timeframe_amount: int = 15
     timeframe_unit: str = "Minute"       # "Minute", "Hour", "Day"
