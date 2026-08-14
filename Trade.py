@@ -318,7 +318,25 @@ def _broad_screen_sector_map() -> Dict[str, str]:
 
 
 def _broad_screen_correlation_groups() -> Dict[str, List[str]]:
-    return {name: list(members) for name, (_etf, members) in BROAD_SCREEN_SECTOR_BUCKETS.items()}
+    """
+    Sector buckets double as correlation groups, PLUS one extra group the
+    sector map can't express: the high-beta/momentum names in
+    BROAD_SCREEN_UNGROUPED.
+
+    Those are "ungrouped" only in the sense that no single sector ETF
+    cleanly describes them -- that is emphatically NOT the same as being
+    uncorrelated with each other. COIN/RIVN/SMCI/RBLX/SOFI/ARM/PLTR and
+    friends are high-beta risk-on names that tend to sell off together on
+    exactly the days a drawdown hurts most. Leaving them out of every
+    correlation group meant max_positions_per_correlation_group never
+    applied to them, so the bot could fill ALL of its concurrent slots
+    with what is effectively one leveraged bet on risk appetite. That
+    became a live concern when the universe grew to 34 symbols (six of
+    them from this list), so they get their own group here.
+    """
+    groups = {name: list(members) for name, (_etf, members) in BROAD_SCREEN_SECTOR_BUCKETS.items()}
+    groups["high_beta_momentum"] = list(BROAD_SCREEN_UNGROUPED)
+    return groups
 
 
 # ==============================================================================
@@ -502,6 +520,25 @@ class TradingConfig:
     # exposure concept doesn't apply there.
     max_total_exposure_pct: float = 1.0
     max_daily_loss_pct: float = 0.03     # halt all new trades after this drawdown
+
+    # --- Ranked entry allocation --------------------------------------------
+    # With a 34-symbol universe and max_positions=5 there are ~7 candidates
+    # per available slot, so WHICH signals get the slots matters as much as
+    # whether a signal is good enough to act on at all. Without this the
+    # bot fills slots in config-list order -- i.e. the FIRST five valid
+    # signals it happens to walk past, which is an arbitrary ordering that
+    # has nothing to do with signal quality. With this on, a cycle scores
+    # every valid candidate first, then spends its remaining slots
+    # best-first.
+    #
+    # Score is an expected-value proxy: the model's probability edge over a
+    # coin flip (confidence - 0.5), scaled by that symbol's OWN realized
+    # live performance multiplier. Both terms are already computed for
+    # sizing, so this reuses evidence the bot already trusts rather than
+    # inventing a new metric -- and it ranks by the same quantity sizing
+    # scales by, so the biggest positions and the first-picked slots agree
+    # with each other instead of being decided on different bases.
+    entry_ranking_enabled: bool = True
     stop_loss_atr_mult: float = 2.0
     take_profit_atr_mult: float = 3.0
     # On by default: TrailingStopManager only ever tightens a resting stop
@@ -1699,6 +1736,26 @@ class Signal:
     reason: str
 
 
+@dataclass
+class EntryCandidate:
+    """
+    A symbol that has cleared every per-symbol entry gate and is competing
+    for one of the cycle's remaining position slots.
+
+    Deliberately carries NO side effects: building one only means "this
+    would be a valid entry", not "this will be entered". The portfolio-level
+    gates (max_positions, correlation caps, total exposure) are applied
+    later, in TradingBot._allocate_entries, against a book that updates as
+    each entry is actually taken -- see that method for why those gates
+    can't be evaluated here.
+    """
+    symbol: str
+    signal: Signal
+    score: float                    # expected-value proxy; higher wins a slot first
+    confidence_multiplier: float    # precomputed sizing inputs, so the
+    symbol_multiplier: float        # allocation phase doesn't recompute them
+
+
 class SignalGenerator:
     """
     Combines the ML model's probability estimate with a lightweight
@@ -1815,6 +1872,10 @@ class RiskManager:
         self.config = config
         self.logger = logger
         self.session_start_equity: Optional[float] = None
+        # Calendar date the current baseline belongs to, so a long-running
+        # process can tell "no baseline yet" apart from "baseline from a
+        # previous day". See new_trading_day_started.
+        self._baseline_date: Optional[str] = None
 
         Path(config.state_dir).mkdir(parents=True, exist_ok=True)
         self.state_path = Path(config.state_dir) / config.daily_state_file
@@ -1835,6 +1896,7 @@ class RiskManager:
 
         if payload.get("date") == self._today_key():
             self.session_start_equity = payload.get("session_start_equity")
+            self._baseline_date = payload.get("date")
             if self.session_start_equity is not None:
                 self.logger.info(
                     f"Restored today's starting equity from disk: "
@@ -1858,8 +1920,46 @@ class RiskManager:
         """
         if self.session_start_equity is None:
             self.session_start_equity = equity
+            self._baseline_date = self._today_key()
             self._save_daily_state()
             self.logger.info(f"Session starting equity set to ${equity:,.2f}")
+
+    def new_trading_day_started(self) -> bool:
+        """
+        True exactly once per calendar day, when the first cycle of a new
+        day sees that the daily-loss baseline still belongs to a previous
+        day -- at which point the baseline is re-anchored to whatever
+        equity is now.
+
+        This exists because `set_session_start_equity` only ever sets the
+        baseline when it is None, which is correct WITHIN a day (a restart
+        must not silently re-anchor the halt to a lower number and hand
+        itself a fresh 3% to lose) but meant a continuously-running process
+        never rolled over at all. The deployed bot runs for days at a time,
+        so the baseline stayed pinned to the first day it ever started:
+        after one 3%-down day the halt condition stayed true against that
+        stale baseline every subsequent day, and since the halt flag was
+        never cleared either, the bot silently stopped trading for good.
+        A restart happened to fix it only because the on-disk state is
+        date-keyed and would be ignored as stale.
+
+        Uses the UTC calendar date, which is safe here: US market hours
+        (14:30-21:00 UTC) never span a UTC midnight, so this can only fire
+        between sessions, never in the middle of one.
+        """
+        today = self._today_key()
+        if self._baseline_date == today:
+            return False
+        if self.session_start_equity is None and self._baseline_date is None:
+            return False  # never started a session yet; not a rollover
+
+        self.logger.info(
+            f"New trading day ({self._baseline_date} -> {today}): resetting the "
+            "daily-loss baseline and clearing any halt from the previous day."
+        )
+        self.session_start_equity = None
+        self._baseline_date = None
+        return True
 
     def daily_loss_halt_triggered(self, current_equity: float) -> bool:
         if self.session_start_equity is None:
@@ -3652,7 +3752,23 @@ class TradingBot:
         open_positions: Dict[str, object],
         minutes_to_close: Optional[float],
         raw_bars: pd.DataFrame,
-    ) -> None:
+    ) -> Optional[EntryCandidate]:
+        """
+        Handles everything that is decided per-symbol in isolation:
+        managing an already-open position (model-flip exit, time-based
+        exit, trailing stop, scale-out) and evaluating whether this symbol
+        is a valid ENTRY candidate.
+
+        Position management still happens immediately and unconditionally
+        here -- exits must never wait on anything else in the cycle.
+
+        Entries do NOT happen here. If the symbol clears every per-symbol
+        gate, this returns an EntryCandidate for the caller to rank against
+        the rest of the universe; the portfolio-level gates and the actual
+        order submission live in _allocate_entries. Returns None when the
+        symbol is not a valid entry this cycle (including whenever it
+        already has a position, since that path is management, not entry).
+        """
         model = self.models[symbol]
         if model.pipeline is None:
             self.logger.info(f"[{symbol}] no trained model yet, skipping")
@@ -3745,53 +3861,152 @@ class TradingBot:
                 symbol, signal.price, effective_stop_price=self.trailing_stop_manager.current_stop(symbol)
             )
             self.trailing_stop_manager.update(symbol, position, signal.price, signal.atr)
-            return  # bracket order already manages stop/take on the resting order
+            return None  # bracket order already manages stop/take on the resting order
 
         # --- No new entries if we're too close to the close ---
         if minutes_to_close is not None and minutes_to_close <= self.config.entry_cutoff_minutes_before_close:
-            return
-
-        # --- No new entries beyond max_positions ---
-        if len(open_positions) >= self.config.max_positions:
-            return
+            return None
 
         if not self._model_has_edge(symbol, model):
-            return
+            return None
 
         if signal.action == "FLAT":
-            return
+            return None
 
-        if self.risk_manager.correlation_limit_reached(symbol, list(open_positions.keys())):
-            return
-
-        performance_multiplier = self._get_performance_multiplier()
+        # Everything above is decided per-symbol, so it's settled here. The
+        # portfolio-level gates (max_positions, correlation caps, exposure
+        # budget) are NOT -- they depend on which other candidates win
+        # slots this cycle, so they're applied in _allocate_entries against
+        # a book that updates as entries are taken.
         confidence_multiplier = self.risk_manager.confidence_size_multiplier(signal.confidence)
         symbol_multiplier = self._get_symbol_performance_multiplier(symbol)
-        qty = self.risk_manager.position_size(
-            equity,
-            signal.price,
-            signal.atr,
-            performance_multiplier=performance_multiplier,
+        return EntryCandidate(
+            symbol=symbol,
+            signal=signal,
+            score=self._entry_score(signal, symbol_multiplier),
             confidence_multiplier=confidence_multiplier,
             symbol_multiplier=symbol_multiplier,
         )
-        if qty <= 0:
-            return
 
-        current_exposure = self._current_portfolio_exposure(open_positions)
-        qty = self.risk_manager.exposure_capped_qty(qty, signal.price, equity, current_exposure)
-        if qty <= 0:
+    def _entry_score(self, signal: Signal, symbol_multiplier: float) -> float:
+        """
+        Expected-value proxy used to rank competing entry candidates.
+
+        `confidence - 0.5` is the model's probability edge over a coin
+        flip, which is the term actually proportional to expected value --
+        raw confidence isn't, since 0.50 means "no information" rather than
+        "half as good as 1.00". Scaling by the symbol's own realized-P&L
+        multiplier folds in live evidence about whether this particular
+        symbol's edge is showing up in practice, which backtesting showed
+        varies a lot symbol to symbol and which validation accuracy did NOT
+        predict well.
+
+        Returns raw confidence when ranking is disabled, so the ordering
+        degrades to "most confident first" rather than to an arbitrary one.
+        """
+        if not self.config.entry_ranking_enabled:
+            return signal.confidence
+        return max(signal.confidence - 0.5, 0.0) * symbol_multiplier
+
+    def _allocate_entries(
+        self,
+        candidates: List[EntryCandidate],
+        equity: float,
+        open_positions: Dict[str, object],
+    ) -> int:
+        """
+        Spends the cycle's remaining position slots on the best available
+        candidates, applying every PORTFOLIO-level risk gate against a book
+        that updates as each entry is taken.
+
+        That last part is the whole point. These gates were previously
+        evaluated inside the per-symbol pass against `open_positions`, which
+        is a snapshot taken ONCE at the top of the cycle and never updated
+        as orders go out. Nothing incremented it when an entry was
+        submitted, so every symbol in the cycle was measured against the
+        same stale book: with 12 simultaneous signals and max_positions=5,
+        all 12 passed `len(open_positions) >= max_positions` and all 12 were
+        submitted. The correlation cap and the total-exposure budget were
+        bypassed the same way, since they read from that same snapshot.
+
+        Re-fetching positions from the broker mid-loop would NOT have fixed
+        it: a submitted bracket order only becomes a position once it
+        fills, so the fresh read would still show the account as flat for
+        as long as the fills take. The fix has to be local accounting --
+        an entry counts against the book the moment it is submitted, not
+        when the broker gets around to confirming it.
+
+        Returns the number of entries actually submitted.
+        """
+        slots_remaining = self.config.max_positions - len(open_positions)
+        if slots_remaining <= 0:
+            return 0
+        if not candidates:
+            return 0
+
+        # Highest score first, symbol as a tiebreak so a tie resolves
+        # deterministically instead of by dict/list ordering.
+        ranked = sorted(candidates, key=lambda c: (-c.score, c.symbol))
+
+        if self.config.entry_ranking_enabled and len(ranked) > slots_remaining:
             self.logger.info(
-                f"[{symbol}] skip entry: no remaining portfolio exposure budget "
-                f"(current=${current_exposure:,.0f}, cap={self.config.max_total_exposure_pct:.0%} of equity)"
+                f"{len(ranked)} entry candidates for {slots_remaining} open slot(s) -- "
+                "taking highest expected-value first: "
+                + ", ".join(f"{c.symbol}({c.score:.3f})" for c in ranked[:slots_remaining + 3])
             )
-            return
 
-        if self.executor.has_open_orders(symbol):
-            self.logger.info(f"[{symbol}] already has open orders, skipping new entry")
-            return
+        # Local, mutable view of the book. Seeded from the broker's real
+        # positions, then updated as this cycle's entries are submitted.
+        held_symbols = list(open_positions.keys())
+        exposure = self._current_portfolio_exposure(open_positions)
+        performance_multiplier = self._get_performance_multiplier()
+        entries_submitted = 0
 
-        self._submit_entry(symbol, signal, qty)
+        for candidate in ranked:
+            if slots_remaining <= 0:
+                self.logger.info(
+                    f"[{candidate.symbol}] skip entry: max_positions "
+                    f"({self.config.max_positions}) reached for this cycle"
+                )
+                break
+
+            symbol, signal = candidate.symbol, candidate.signal
+
+            if self.risk_manager.correlation_limit_reached(symbol, held_symbols):
+                continue
+
+            qty = self.risk_manager.position_size(
+                equity,
+                signal.price,
+                signal.atr,
+                performance_multiplier=performance_multiplier,
+                confidence_multiplier=candidate.confidence_multiplier,
+                symbol_multiplier=candidate.symbol_multiplier,
+            )
+            if qty <= 0:
+                continue
+
+            qty = self.risk_manager.exposure_capped_qty(qty, signal.price, equity, exposure)
+            if qty <= 0:
+                self.logger.info(
+                    f"[{symbol}] skip entry: no remaining portfolio exposure budget "
+                    f"(current=${exposure:,.0f}, cap={self.config.max_total_exposure_pct:.0%} of equity)"
+                )
+                continue
+
+            if self.executor.has_open_orders(symbol):
+                self.logger.info(f"[{symbol}] already has open orders, skipping new entry")
+                continue
+
+            self._submit_entry(symbol, signal, qty)
+
+            # Count it against the book NOW -- see the docstring above.
+            held_symbols.append(symbol)
+            exposure += qty * signal.price
+            slots_remaining -= 1
+            entries_submitted += 1
+
+        return entries_submitted
 
     def _submit_entry(self, symbol: str, signal: Signal, qty: int) -> None:
         """
@@ -3879,6 +4094,13 @@ class TradingBot:
                     time.sleep(self.config.poll_interval_seconds)
                     continue
 
+                # A new calendar day re-anchors the daily-loss baseline and
+                # lifts yesterday's halt. Without this a continuously-running
+                # process keeps measuring against the first day it ever
+                # started and stays halted forever after one bad day.
+                if self.risk_manager.new_trading_day_started():
+                    self.halted = False
+
                 self.risk_manager.set_session_start_equity(equity)
 
                 if self.risk_manager.daily_loss_halt_triggered(equity):
@@ -3919,15 +4141,34 @@ class TradingBot:
                     continue
 
                 prefetched_bars = self._prefetch_bars(self.config.symbols)
+
+                # Phase 1 -- per-symbol work: manage every open position
+                # (exits, trailing stops, scale-outs happen immediately and
+                # are never deferred) and collect the symbols that qualify
+                # as entry candidates.
+                candidates: List[EntryCandidate] = []
                 for symbol in self.config.symbols:
                     try:
-                        self._process_symbol(
+                        candidate = self._process_symbol(
                             symbol, equity, open_positions, minutes_to_close,
                             prefetched_bars.get(symbol, pd.DataFrame()),
                         )
+                        if candidate is not None:
+                            candidates.append(candidate)
                     except Exception as exc:
                         self.logger.error(f"[{symbol}] error while processing: {exc}")
                         self.logger.debug(traceback.format_exc())
+
+                # Phase 2 -- portfolio-level work: rank those candidates and
+                # spend the remaining slots on the best of them, enforcing
+                # max_positions / correlation / exposure against a book that
+                # updates as entries go out. Ranking only matters because
+                # this is deferred until every candidate is known.
+                try:
+                    self._allocate_entries(candidates, equity, open_positions)
+                except Exception as exc:
+                    self.logger.error(f"error while allocating entries: {exc}")
+                    self.logger.debug(traceback.format_exc())
 
                 self.journal.log_equity(equity, cash, len(open_positions))
                 self.fill_tracker.poll_and_record()
