@@ -2374,13 +2374,19 @@ class OrderExecutor:
     def get_account(self):
         return call_with_retry(self.client.get_account, logger=self.logger)
 
-    def get_open_positions(self) -> Dict[str, object]:
+    def get_open_positions(self) -> Optional[Dict[str, object]]:
+        """Return filled positions, or None when broker state is unknown.
+
+        Returning an empty dictionary on an API failure is unsafe because it
+        is indistinguishable from a genuinely flat account and can authorize
+        new exposure. The live loop treats None as a fail-closed cycle.
+        """
         try:
             positions = call_with_retry(self.client.get_all_positions, logger=self.logger)
             return {p.symbol: p for p in positions}
         except Exception as exc:
             self.logger.error(f"Failed to fetch positions after retries: {exc}")
-            return {}
+            return None
 
     def get_open_orders(self) -> Optional[List[object]]:
         """Return every open order, or None when order state is unknown.
@@ -4499,7 +4505,7 @@ class TradingBot:
         portfolio: PortfolioCycleState,
         minutes_to_close: Optional[float],
         raw_bars: pd.DataFrame,
-    ) -> None:
+    ) -> Optional[EntryCandidate]:
         open_positions = portfolio.open_positions
         model = self.models[symbol]
         if model.pipeline is None:
@@ -4639,32 +4645,123 @@ class TradingBot:
             symbol_multiplier=symbol_multiplier,
         )
 
-        current_exposure = portfolio.total_exposure
-        qty = self.risk_manager.exposure_capped_qty(qty, signal.price, equity, current_exposure)
-        if qty <= 0:
+    def _entry_score(self, signal: Signal, symbol_multiplier: float) -> float:
+        """Keep live candidate ranking identical to the portfolio backtest."""
+        return entry_score(
+            signal.confidence, symbol_multiplier, self.config.entry_ranking_enabled
+        )
+
+    def _collect_entry_candidates(
+        self,
+        equity: float,
+        portfolio: PortfolioCycleState,
+        minutes_to_close: Optional[float],
+        prefetched_bars: Dict[str, pd.DataFrame],
+    ) -> Tuple[List[EntryCandidate], Dict[str, str]]:
+        """Manage every symbol and retain each valid entry candidate.
+
+        Keeping this as a separately testable boundary prevents the live loop
+        from accidentally discarding ``_process_symbol`` return values. Symbol
+        failures remain isolated, but are returned to the caller so the cycle
+        heartbeat can report degraded health instead of looking fully healthy.
+        """
+        candidates: List[EntryCandidate] = []
+        errors: Dict[str, str] = {}
+        for symbol in self.config.symbols:
+            try:
+                candidate = self._process_symbol(
+                    symbol,
+                    equity,
+                    portfolio,
+                    minutes_to_close,
+                    prefetched_bars.get(symbol, pd.DataFrame()),
+                )
+                if candidate is not None:
+                    candidates.append(candidate)
+            except Exception as exc:
+                errors[symbol] = str(exc)
+                self.logger.error(f"[{symbol}] error while processing: {exc}")
+                self.logger.debug(traceback.format_exc())
+        return candidates, errors
+
+    def _allocate_entries(
+        self,
+        candidates: List[EntryCandidate],
+        equity: float,
+        portfolio: PortfolioCycleState,
+    ) -> int:
+        """Submit the strongest candidates within all portfolio limits.
+
+        Filled positions and accepted-but-unfilled entries share the same
+        mutable cycle state. A successful submission immediately reserves its
+        slot and estimated notional; a rejected submission consumes neither,
+        allowing the next ranked candidate to be considered safely.
+        """
+        if not portfolio.entries_allowed or not candidates:
+            return 0
+
+        slots_remaining = self.config.max_positions - portfolio.occupied_count
+        if slots_remaining <= 0:
+            return 0
+
+        ranked = sorted(candidates, key=lambda candidate: (-candidate.score, candidate.symbol))
+        if self.config.entry_ranking_enabled and len(ranked) > slots_remaining:
             self.logger.info(
                 f"{len(ranked)} entry candidates for {slots_remaining} open slot(s) -- "
                 "taking highest expected-value first: "
-                + ", ".join(f"{c.symbol}({c.score:.3f})" for c in ranked[:slots_remaining + 3])
+                + ", ".join(
+                    f"{candidate.symbol}({candidate.score:.3f})"
+                    for candidate in ranked[:slots_remaining + 3]
+                )
             )
 
-        # Local, mutable view of the book. Seeded from the broker's real
-        # positions, then updated as this cycle's entries are submitted.
-        held_symbols = list(open_positions.keys())
-        exposure = self._current_portfolio_exposure(open_positions)
+        held_symbols = set(portfolio.occupied_symbols)
+        exposure = portfolio.total_exposure
         performance_multiplier = self._get_performance_multiplier()
         entries_submitted = 0
 
         for candidate in ranked:
             if slots_remaining <= 0:
-                self.logger.info(
-                    f"[{candidate.symbol}] skip entry: max_positions "
-                    f"({self.config.max_positions}) reached for this cycle"
-                )
                 break
 
-        if self._submit_entry(symbol, signal, qty):
+            symbol, signal = candidate.symbol, candidate.signal
+            if symbol in held_symbols:
+                continue
+            if self.risk_manager.correlation_limit_reached(symbol, list(held_symbols)):
+                continue
+
+            qty = self.risk_manager.position_size(
+                equity,
+                signal.price,
+                signal.atr,
+                performance_multiplier=performance_multiplier,
+                confidence_multiplier=candidate.confidence_multiplier,
+                symbol_multiplier=candidate.symbol_multiplier,
+            )
+            if qty <= 0:
+                continue
+
+            qty = self.risk_manager.exposure_capped_qty(
+                qty, signal.price, equity, exposure
+            )
+            if qty <= 0:
+                self.logger.info(
+                    f"[{symbol}] skip entry: no remaining portfolio exposure budget "
+                    f"(current=${exposure:,.0f}, "
+                    f"cap={self.config.max_total_exposure_pct:.0%} of equity)"
+                )
+                continue
+
+            if not self._submit_entry(symbol, signal, qty):
+                continue
+
             portfolio.reserve_entry(symbol, qty * signal.price)
+            held_symbols.add(symbol)
+            exposure = portfolio.total_exposure
+            slots_remaining -= 1
+            entries_submitted += 1
+
+        return entries_submitted
 
     def _submit_entry(self, symbol: str, signal: Signal, qty: int) -> bool:
         """
@@ -4777,6 +4874,12 @@ class TradingBot:
 
                 minutes_to_close = self.data_feed.minutes_to_close()
                 open_positions = self.executor.get_open_positions()
+                if open_positions is None:
+                    detail = "Filled-position state is unavailable; blocking this cycle"
+                    self.logger.error(detail)
+                    self._write_heartbeat("degraded", {"detail": detail})
+                    time.sleep(self.config.poll_interval_seconds)
+                    continue
                 portfolio = self._build_portfolio_cycle_state(open_positions)
 
                 # A position may have closed on its own (stop/take fill) since
@@ -4808,40 +4911,47 @@ class TradingBot:
                 # (exits, trailing stops, scale-outs happen immediately and
                 # are never deferred) and collect the symbols that qualify
                 # as entry candidates.
-                candidates: List[EntryCandidate] = []
-                for symbol in self.config.symbols:
-                    try:
-                        self._process_symbol(
-                            symbol, equity, portfolio, minutes_to_close,
-                            prefetched_bars.get(symbol, pd.DataFrame()),
-                        )
-                        if candidate is not None:
-                            candidates.append(candidate)
-                    except Exception as exc:
-                        self.logger.error(f"[{symbol}] error while processing: {exc}")
-                        self.logger.debug(traceback.format_exc())
+                candidates, symbol_errors = self._collect_entry_candidates(
+                    equity, portfolio, minutes_to_close, prefetched_bars
+                )
 
                 # Phase 2 -- portfolio-level work: rank those candidates and
                 # spend the remaining slots on the best of them, enforcing
                 # max_positions / correlation / exposure against a book that
                 # updates as entries go out. Ranking only matters because
                 # this is deferred until every candidate is known.
+                allocation_error = None
+                entries_submitted = 0
                 try:
-                    self._allocate_entries(candidates, equity, open_positions)
+                    entries_submitted = self._allocate_entries(candidates, equity, portfolio)
                 except Exception as exc:
+                    allocation_error = str(exc)
                     self.logger.error(f"error while allocating entries: {exc}")
                     self.logger.debug(traceback.format_exc())
+
+                cycle_degraded = bool(symbol_errors or allocation_error)
+                self.logger.info(
+                    "Cycle summary: "
+                    f"symbols={len(self.config.symbols)} "
+                    f"errors={len(symbol_errors)} candidates={len(candidates)} "
+                    f"entries_submitted={entries_submitted} "
+                    f"positions={len(open_positions)} pending={len(portfolio.reserved_symbols)}"
+                )
 
                 self.journal.log_equity(equity, cash, len(open_positions))
                 self.fill_tracker.poll_and_record()
                 self._write_heartbeat(
-                    "running",
+                    "degraded" if cycle_degraded else "running",
                     {
                         "equity": equity,
                         "cash": cash,
                         "open_positions": len(open_positions),
                         "pending_entries": len(portfolio.reserved_symbols),
                         "occupied_slots": portfolio.occupied_count,
+                        "entry_candidates": len(candidates),
+                        "entries_submitted": entries_submitted,
+                        "symbol_errors": symbol_errors,
+                        "allocation_error": allocation_error,
                     },
                 )
 

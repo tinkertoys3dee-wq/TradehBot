@@ -3,18 +3,21 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
 
 from Trade import (
     Backtester,
+    EntryCandidate,
     FeatureEngineer,
     MLSignalModel,
     OrderClass,
     OrderExecutor,
     OrderSide,
     PortfolioCycleState,
+    RiskManager,
     ScaleOutManager,
     Signal,
     SignalGenerator,
@@ -176,6 +179,11 @@ class BacktestChronologyTests(TempConfigMixin, unittest.TestCase):
 
 
 class PortfolioReservationTests(unittest.TestCase):
+    def test_unknown_position_state_is_not_reported_as_a_flat_account(self) -> None:
+        executor = OrderExecutor(SimpleNamespace(), TradingConfig(), quiet_logger())
+        with patch("Trade.call_with_retry", side_effect=RuntimeError("broker unavailable")):
+            self.assertIsNone(executor.get_open_positions())
+
     def test_reservations_count_slots_and_notional_once(self) -> None:
         state = PortfolioCycleState(open_positions={}, open_exposure=100.0)
         state.reserve_entry("AAPL", 250.0)
@@ -223,6 +231,92 @@ class PortfolioReservationTests(unittest.TestCase):
         state = bot._build_portfolio_cycle_state({})
 
         self.assertTrue(np.isinf(state.total_exposure))
+
+
+class LiveEntryPipelineTests(TempConfigMixin, unittest.TestCase):
+    @staticmethod
+    def candidate(symbol: str, score: float) -> EntryCandidate:
+        signal = Signal(symbol, "BUY", 0.70, 100.0, 1.0, "test")
+        return EntryCandidate(
+            symbol=symbol,
+            signal=signal,
+            score=score,
+            confidence_multiplier=1.0,
+            symbol_multiplier=1.0,
+        )
+
+    def make_allocator_bot(self, max_positions: int = 2):
+        self.config.max_positions = max_positions
+        self.config.correlation_groups = {}
+        bot = TradingBot.__new__(TradingBot)
+        bot.config = self.config
+        bot.logger = self.logger
+        bot.risk_manager = RiskManager(self.config, self.logger)
+        bot._get_performance_multiplier = lambda: 1.0
+        return bot
+
+    def test_candidate_collection_retains_returns_and_reports_errors(self) -> None:
+        self.config.symbols = ["GOOD", "FLAT", "BROKEN"]
+        bot = TradingBot.__new__(TradingBot)
+        bot.config = self.config
+        bot.logger = self.logger
+
+        def process(symbol, *_args):
+            if symbol == "GOOD":
+                return self.candidate(symbol, 0.2)
+            if symbol == "BROKEN":
+                raise RuntimeError("synthetic processing failure")
+            return None
+
+        bot._process_symbol = process
+        portfolio = PortfolioCycleState(open_positions={}, open_exposure=0.0)
+
+        candidates, errors = bot._collect_entry_candidates(
+            100_000.0, portfolio, 120.0, {}
+        )
+
+        self.assertEqual([candidate.symbol for candidate in candidates], ["GOOD"])
+        self.assertEqual(errors, {"BROKEN": "synthetic processing failure"})
+
+    def test_ranked_allocation_reserves_only_available_slots(self) -> None:
+        bot = self.make_allocator_bot(max_positions=2)
+        submitted = []
+        bot._submit_entry = (
+            lambda symbol, signal, qty: submitted.append((symbol, qty)) or True
+        )
+        portfolio = PortfolioCycleState(open_positions={}, open_exposure=0.0)
+
+        count = bot._allocate_entries(
+            [self.candidate("LOW", 0.1), self.candidate("HIGH", 0.3), self.candidate("MID", 0.2)],
+            100_000.0,
+            portfolio,
+        )
+
+        self.assertEqual([symbol for symbol, _qty in submitted], ["HIGH", "MID"])
+        self.assertEqual(count, 2)
+        self.assertEqual(portfolio.reserved_symbols, {"HIGH", "MID"})
+        self.assertEqual(portfolio.occupied_count, 2)
+
+    def test_rejected_submission_does_not_consume_the_slot(self) -> None:
+        bot = self.make_allocator_bot(max_positions=1)
+        attempted = []
+
+        def submit(symbol, _signal, _qty):
+            attempted.append(symbol)
+            return symbol != "REJECTED"
+
+        bot._submit_entry = submit
+        portfolio = PortfolioCycleState(open_positions={}, open_exposure=0.0)
+
+        count = bot._allocate_entries(
+            [self.candidate("REJECTED", 0.3), self.candidate("NEXT", 0.2)],
+            100_000.0,
+            portfolio,
+        )
+
+        self.assertEqual(attempted, ["REJECTED", "NEXT"])
+        self.assertEqual(count, 1)
+        self.assertEqual(portfolio.reserved_symbols, {"NEXT"})
 
 
 class OrderProtectionTests(TempConfigMixin, unittest.TestCase):
