@@ -315,7 +315,25 @@ def _broad_screen_sector_map() -> Dict[str, str]:
 
 
 def _broad_screen_correlation_groups() -> Dict[str, List[str]]:
-    return {name: list(members) for name, (_etf, members) in BROAD_SCREEN_SECTOR_BUCKETS.items()}
+    """
+    Sector buckets double as correlation groups, PLUS one extra group the
+    sector map can't express: the high-beta/momentum names in
+    BROAD_SCREEN_UNGROUPED.
+
+    Those are "ungrouped" only in the sense that no single sector ETF
+    cleanly describes them -- that is emphatically NOT the same as being
+    uncorrelated with each other. COIN/RIVN/SMCI/RBLX/SOFI/ARM/PLTR and
+    friends are high-beta risk-on names that tend to sell off together on
+    exactly the days a drawdown hurts most. Leaving them out of every
+    correlation group meant max_positions_per_correlation_group never
+    applied to them, so the bot could fill ALL of its concurrent slots
+    with what is effectively one leveraged bet on risk appetite. That
+    became a live concern when the universe grew to 34 symbols (six of
+    them from this list), so they get their own group here.
+    """
+    groups = {name: list(members) for name, (_etf, members) in BROAD_SCREEN_SECTOR_BUCKETS.items()}
+    groups["high_beta_momentum"] = list(BROAD_SCREEN_UNGROUPED)
+    return groups
 
 
 # ==============================================================================
@@ -499,6 +517,25 @@ class TradingConfig:
     # exposure concept doesn't apply there.
     max_total_exposure_pct: float = 1.0
     max_daily_loss_pct: float = 0.03     # halt all new trades after this drawdown
+
+    # --- Ranked entry allocation --------------------------------------------
+    # With a 34-symbol universe and max_positions=5 there are ~7 candidates
+    # per available slot, so WHICH signals get the slots matters as much as
+    # whether a signal is good enough to act on at all. Without this the
+    # bot fills slots in config-list order -- i.e. the FIRST five valid
+    # signals it happens to walk past, which is an arbitrary ordering that
+    # has nothing to do with signal quality. With this on, a cycle scores
+    # every valid candidate first, then spends its remaining slots
+    # best-first.
+    #
+    # Score is an expected-value proxy: the model's probability edge over a
+    # coin flip (confidence - 0.5), scaled by that symbol's OWN realized
+    # live performance multiplier. Both terms are already computed for
+    # sizing, so this reuses evidence the bot already trusts rather than
+    # inventing a new metric -- and it ranks by the same quantity sizing
+    # scales by, so the biggest positions and the first-picked slots agree
+    # with each other instead of being decided on different bases.
+    entry_ranking_enabled: bool = True
     stop_loss_atr_mult: float = 2.0
     take_profit_atr_mult: float = 3.0
     # On by default: TrailingStopManager only ever tightens a resting stop
@@ -1896,6 +1933,53 @@ class Signal:
     reason: str
 
 
+def entry_score(confidence: float, symbol_multiplier: float, ranking_enabled: bool = True) -> float:
+    """
+    Expected-value proxy used to rank competing entry candidates when
+    there are more valid signals than free position slots.
+
+    `confidence - 0.5` is the model's probability edge over a coin flip,
+    which is the term actually proportional to expected value -- raw
+    confidence is not, since 0.50 means "no information" rather than
+    "half as good as 1.00". Scaling by the symbol's own realized-P&L
+    multiplier folds in live evidence about whether this particular
+    symbol's edge is showing up in practice, which backtesting showed
+    varies a lot symbol to symbol and which validation accuracy did NOT
+    predict well.
+
+    Module-level so the live path (TradingBot._entry_score) and the
+    portfolio backtest (Backtester.run_portfolio) rank by exactly the
+    same formula -- if these two ever disagreed, the backtest would stop
+    being a measurement of the thing that actually trades.
+
+    Returns raw confidence when ranking is disabled, so the ordering
+    degrades to "most confident first" rather than to an arbitrary one.
+    """
+    if not ranking_enabled:
+        return confidence
+    return max(confidence - 0.5, 0.0) * symbol_multiplier
+
+
+@dataclass
+class EntryCandidate:
+    """
+    A symbol that has cleared every per-symbol entry gate and is competing
+    for one of the cycle's remaining position slots.
+
+    Deliberately carries NO side effects: building one only means "this
+    would be a valid entry", not "this will be entered". The portfolio-level
+    gates (max_positions, correlation caps, total exposure) are applied
+    later, in TradingBot._allocate_entries, against a book that updates as
+    each entry is actually taken -- see that method for why those gates
+    can't be evaluated here.
+    """
+    symbol: str
+    signal: Signal
+    score: float                    # expected-value proxy; higher wins a slot first
+    confidence_multiplier: float    # precomputed sizing inputs, so the
+    symbol_multiplier: float        # allocation phase doesn't recompute them
+
+
 class SignalGenerator:
     """
     Combines the ML model's probability estimate with a lightweight
@@ -2023,6 +2107,10 @@ class RiskManager:
         self.config = config
         self.logger = logger
         self.session_start_equity: Optional[float] = None
+        # Calendar date the current baseline belongs to, so a long-running
+        # process can tell "no baseline yet" apart from "baseline from a
+        # previous day". See new_trading_day_started.
+        self._baseline_date: Optional[str] = None
 
         Path(config.state_dir).mkdir(parents=True, exist_ok=True)
         self.state_path = Path(config.state_dir) / config.daily_state_file
@@ -2043,6 +2131,7 @@ class RiskManager:
 
         if payload.get("date") == self._today_key():
             self.session_start_equity = payload.get("session_start_equity")
+            self._baseline_date = payload.get("date")
             if self.session_start_equity is not None:
                 self.logger.info(
                     f"Restored today's starting equity from disk: "
@@ -2066,8 +2155,46 @@ class RiskManager:
         """
         if self.session_start_equity is None:
             self.session_start_equity = equity
+            self._baseline_date = self._today_key()
             self._save_daily_state()
             self.logger.info(f"Session starting equity set to ${equity:,.2f}")
+
+    def new_trading_day_started(self) -> bool:
+        """
+        True exactly once per calendar day, when the first cycle of a new
+        day sees that the daily-loss baseline still belongs to a previous
+        day -- at which point the baseline is re-anchored to whatever
+        equity is now.
+
+        This exists because `set_session_start_equity` only ever sets the
+        baseline when it is None, which is correct WITHIN a day (a restart
+        must not silently re-anchor the halt to a lower number and hand
+        itself a fresh 3% to lose) but meant a continuously-running process
+        never rolled over at all. The deployed bot runs for days at a time,
+        so the baseline stayed pinned to the first day it ever started:
+        after one 3%-down day the halt condition stayed true against that
+        stale baseline every subsequent day, and since the halt flag was
+        never cleared either, the bot silently stopped trading for good.
+        A restart happened to fix it only because the on-disk state is
+        date-keyed and would be ignored as stale.
+
+        Uses the UTC calendar date, which is safe here: US market hours
+        (14:30-21:00 UTC) never span a UTC midnight, so this can only fire
+        between sessions, never in the middle of one.
+        """
+        today = self._today_key()
+        if self._baseline_date == today:
+            return False
+        if self.session_start_equity is None and self._baseline_date is None:
+            return False  # never started a session yet; not a rollover
+
+        self.logger.info(
+            f"New trading day ({self._baseline_date} -> {today}): resetting the "
+            "daily-loss baseline and clearing any halt from the previous day."
+        )
+        self.session_start_equity = None
+        self._baseline_date = None
+        return True
 
     def daily_loss_halt_triggered(self, current_equity: float) -> bool:
         if self.session_start_equity is None:
@@ -3602,6 +3729,277 @@ class Backtester:
             symbol, combined_trades, combined_equity_curve, starting_equity, equity, fold_val_accuracies
         )
 
+    # ------------------------------------------------- portfolio backtest
+    def _build_datasets(
+        self, market_df: Optional[pd.DataFrame], sector_bars_by_etf: Dict[str, pd.DataFrame]
+    ) -> Dict[str, pd.DataFrame]:
+        """Fetches and featurizes every symbol once, for run_portfolio."""
+        datasets: Dict[str, pd.DataFrame] = {}
+        for symbol in self.config.symbols:
+            raw_bars = self.data_feed.fetch_bars(
+                symbol, lookback_days=self.config.backtest_lookback_days
+            )
+            if raw_bars.empty:
+                self.logger.warning(f"[{symbol}] no historical bars -- excluded from portfolio backtest")
+                continue
+            sector_etf = self.config.sector_map.get(symbol)
+            sector_df = sector_bars_by_etf.get(sector_etf) if sector_etf else None
+            dataset = self.feature_engineer.build_dataset(
+                raw_bars, self.config, market_df=market_df, sector_df=sector_df
+            )
+            if len(dataset) < self.config.min_bars_required:
+                self.logger.warning(
+                    f"[{symbol}] only {len(dataset)} usable rows -- excluded from portfolio backtest"
+                )
+                continue
+            datasets[symbol] = dataset
+        return datasets
+
+    def run_portfolio(self, starting_equity: float = 100_000.0) -> Dict:
+        """
+        Walk-forward backtest of the PORTFOLIO rather than of each symbol
+        in isolation -- one shared equity pool, competing for a limited
+        number of position slots, under the same allocation rules the live
+        bot uses.
+
+        Why this exists: run()/run_symbol_walkforward give every symbol its
+        own independent $100k and let it hold a position whenever it wants.
+        That answers "does this symbol have an edge?", which is the right
+        question for screening, and it is what the symbol shortlists were
+        built from. It emphatically does NOT answer "what will this bot
+        make?", because live there is ONE account, max_positions slots
+        (5) shared across the whole universe (34), correlation caps, and a
+        total-exposure budget. With ~7 candidates per slot, most signals
+        the per-symbol backtest happily trades are ones the live bot will
+        never have room to take -- so summing or averaging per-symbol
+        returns systematically overstates what is actually reachable.
+
+        This walks a single combined timeline, and at each bar: settles
+        exits first, then collects entry candidates across every symbol,
+        ranks them by the same entry_score() the live bot ranks by, and
+        fills only the free slots -- respecting max_positions, the
+        correlation caps and the exposure budget against a book that
+        updates as entries are taken, exactly like _allocate_entries.
+
+        Same walk-forward discipline as the per-symbol version: folds are
+        cut on the combined timeline, and every symbol's model is retrained
+        on its own history up to each fold's start (embargoed by
+        label_horizon_bars() to prevent look-ahead leakage).
+
+        Returns a summary dict; also returns the per-symbol trade
+        attribution so it's possible to see which symbols actually earned
+        their slots when they had to compete for them.
+        """
+        market_df = None
+        if self.config.market_context_enabled:
+            market_df = self.data_feed.fetch_bars(
+                self.config.market_context_symbol, lookback_days=self.config.backtest_lookback_days
+            )
+
+        sector_bars_by_etf: Dict[str, pd.DataFrame] = {}
+        if self.config.sector_context_enabled:
+            needed = {self.config.sector_map[s] for s in self.config.symbols if s in self.config.sector_map}
+            for etf in needed:
+                sector_bars_by_etf[etf] = self.data_feed.fetch_bars(
+                    etf, lookback_days=self.config.backtest_lookback_days
+                )
+
+        self.logger.info(f"Portfolio backtest: building datasets for {len(self.config.symbols)} symbols...")
+        datasets = self._build_datasets(market_df, sector_bars_by_etf)
+        if not datasets:
+            self.logger.error("Portfolio backtest: no symbols had usable data")
+            return {}
+
+        # One combined, de-duplicated timeline across every symbol.
+        timeline = sorted(set().union(*(set(df.index) for df in datasets.values())))
+        row_at: Dict[str, Dict] = {
+            sym: {ts: i for i, ts in enumerate(df.index)} for sym, df in datasets.items()
+        }
+
+        n_folds = max(1, self.config.backtest_walkforward_folds)
+        seed_end = int(len(timeline) * (1 - self.config.backtest_test_fraction))
+        oos_len = len(timeline) - seed_end
+        fold_size = oos_len // n_folds
+        if fold_size < 30:
+            self.logger.warning(
+                f"Portfolio backtest: only {oos_len} out-of-sample bars for {n_folds} folds -- "
+                "using a single fold instead"
+            )
+            n_folds, fold_size = 1, oos_len
+
+        embargo = self.config.label_horizon_bars()
+        equity = starting_equity
+        equity_curve: List[float] = [equity]
+        all_trades: List[Dict] = []
+        positions: Dict[str, Dict] = {}
+        fold_accuracies: List[float] = []
+
+        for fold_idx in range(n_folds):
+            fold_lo = seed_end + fold_idx * fold_size
+            fold_hi = len(timeline) if fold_idx == n_folds - 1 else fold_lo + fold_size
+            fold_start_ts = timeline[fold_lo]
+
+            # Retrain every symbol on its own history strictly before this
+            # fold, minus the embargo, mirroring periodic live retraining.
+            self.logger.info(
+                f"Portfolio backtest: fold {fold_idx + 1}/{n_folds} -- training {len(datasets)} models..."
+            )
+            models: Dict[str, MLSignalModel] = {}
+            for sym, df in datasets.items():
+                prior = df[df.index < fold_start_ts]
+                if embargo > 0:
+                    prior = prior.iloc[:-embargo] if len(prior) > embargo else prior.iloc[:0]
+                if len(prior) < self.config.min_bars_required:
+                    continue
+                model = MLSignalModel(f"{sym}_backtest_pf", self.config, self.logger)
+                model.train(prior)
+                if model.pipeline is None:
+                    self._cleanup_backtest_model(model)
+                    continue
+                models[sym] = model
+                fold_accuracies.append(model.last_val_accuracy)
+
+            if not models:
+                self.logger.warning(f"Portfolio backtest: fold {fold_idx + 1} trained no models, skipping")
+                continue
+
+            for ts in timeline[fold_lo:fold_hi]:
+                # ---- 1. Settle exits first, freeing slots for this bar ----
+                for sym in list(positions):
+                    idx = row_at.get(sym, {}).get(ts)
+                    if idx is None:
+                        continue
+                    row = datasets[sym].iloc[idx]
+                    pos = positions[sym]
+                    pos["bars_held"] += 1
+
+                    hit_stop = (
+                        row["low"] <= pos["stop"] if pos["side"] == "BUY"
+                        else row["high"] >= pos["stop"]
+                    )
+                    hit_take = (
+                        row["high"] >= pos["take"] if pos["side"] == "BUY"
+                        else row["low"] <= pos["take"]
+                    )
+                    time_exit = pos["bars_held"] >= self.config.prediction_horizon_bars * 3
+
+                    exit_price = (
+                        pos["stop"] if hit_stop
+                        else pos["take"] if hit_take
+                        else float(row["close"]) if time_exit
+                        else None
+                    )
+                    if exit_price is None:
+                        continue
+
+                    effective_exit = exit_price * self._cost_multiplier(pos["side"], is_entry=False)
+                    direction = 1 if pos["side"] == "BUY" else -1
+                    pnl = direction * pos["qty"] * (effective_exit - pos["entry_price"])
+                    equity += pnl
+                    all_trades.append({
+                        "symbol": sym, "side": pos["side"], "qty": pos["qty"],
+                        "entry_price": pos["entry_price"], "exit_price": effective_exit,
+                        "pnl": pnl, "exit_ts": ts,
+                    })
+                    del positions[sym]
+
+                # ---- 2. Collect entry candidates across the universe ----
+                slots = self.config.max_positions - len(positions)
+                if slots > 0:
+                    candidates = []
+                    for sym, model in models.items():
+                        if sym in positions:
+                            continue
+                        idx = row_at.get(sym, {}).get(ts)
+                        if idx is None:
+                            continue
+                        row = datasets[sym].iloc[idx]
+                        signal = self.signal_generator.generate(sym, model, row, daily_trend=None)
+                        if signal.action not in ("BUY", "SELL"):
+                            continue
+                        # symbol_multiplier is pinned to 1.0 (neutral) here:
+                        # live it comes from that symbol's REALIZED trade
+                        # history, which does not exist inside a backtest.
+                        # Feeding it backtest-derived P&L would be
+                        # look-ahead -- ranking a symbol using results it
+                        # only produced later in this same simulation. So
+                        # the backtest ranks on probability edge alone,
+                        # which makes it a slightly CONSERVATIVE estimate
+                        # of the live ranker rather than an optimistic one.
+                        candidates.append((
+                            entry_score(signal.confidence, 1.0, self.config.entry_ranking_enabled),
+                            sym, signal,
+                        ))
+
+                    # ---- 3. Allocate slots best-first, same as live ----
+                    exposure = sum(p["qty"] * p["entry_price"] for p in positions.values())
+                    for score, sym, signal in sorted(candidates, key=lambda c: (-c[0], c[1])):
+                        if slots <= 0:
+                            break
+                        if self.risk_manager.correlation_limit_reached(sym, list(positions.keys())):
+                            continue
+                        qty = self.risk_manager.position_size(
+                            equity, signal.price, signal.atr,
+                            confidence_multiplier=self.risk_manager.confidence_size_multiplier(
+                                signal.confidence
+                            ),
+                        )
+                        if qty <= 0:
+                            continue
+                        qty = self.risk_manager.exposure_capped_qty(qty, signal.price, equity, exposure)
+                        if qty <= 0:
+                            continue
+
+                        entry_price = signal.price * self._cost_multiplier(signal.action, is_entry=True)
+                        stop, take = self.risk_manager.stop_take_levels(
+                            signal.price, signal.atr, signal.action
+                        )
+                        positions[sym] = {
+                            "side": signal.action, "qty": qty, "entry_price": entry_price,
+                            "stop": stop, "take": take, "bars_held": 0,
+                        }
+                        exposure += qty * signal.price
+                        slots -= 1
+
+                equity_curve.append(equity)
+
+            for model in models.values():
+                self._cleanup_backtest_model(model)
+
+        # Mark any still-open position to its last close so the final
+        # equity reflects the whole book, not just closed trades.
+        for sym, pos in positions.items():
+            last_close = float(datasets[sym]["close"].iloc[-1])
+            direction = 1 if pos["side"] == "BUY" else -1
+            equity += direction * pos["qty"] * (last_close - pos["entry_price"])
+
+        equity_series = pd.Series(equity_curve)
+        trades_df = pd.DataFrame(all_trades)
+        per_symbol = (
+            trades_df.groupby("symbol")
+            .agg(n_trades=("pnl", "size"), total_pnl=("pnl", "sum"),
+                 win_rate=("pnl", lambda s: float((s > 0).mean())))
+            .sort_values("total_pnl", ascending=False)
+            if len(trades_df) else pd.DataFrame()
+        )
+
+        return {
+            "starting_equity": starting_equity,
+            "final_equity": equity,
+            "total_return": (equity / starting_equity) - 1,
+            "n_trades": len(trades_df),
+            "win_rate": float((trades_df["pnl"] > 0).mean()) if len(trades_df) else 0.0,
+            "max_drawdown": PerformanceAnalyzer._max_drawdown(equity_series),
+            "sharpe_approx": PerformanceAnalyzer._sharpe_ratio(
+                equity_series, periods_per_year=252 * 26
+            ),
+            "n_symbols": len(datasets),
+            "n_folds": n_folds,
+            "mean_val_accuracy": float(np.mean(fold_accuracies)) if fold_accuracies else 0.0,
+            "per_symbol": per_symbol,
+            "equity_curve": equity_series,
+        }
+
     def run(self) -> pd.DataFrame:
         market_df = None
         if self.config.market_context_enabled:
@@ -4195,7 +4593,7 @@ class TradingBot:
                 symbol, signal.price, effective_stop_price=self.trailing_stop_manager.current_stop(symbol)
             )
             self.trailing_stop_manager.update(symbol, position, signal.price, signal.atr)
-            return  # bracket order already manages stop/take on the resting order
+            return None  # bracket order already manages stop/take on the resting order
 
         # Accepted-but-unfilled entry orders occupy risk capacity just like a
         # filled position. Do not submit another decision for that symbol or
@@ -4216,7 +4614,7 @@ class TradingBot:
             return
 
         if not self._model_has_edge(symbol, model):
-            return
+            return None
 
         if signal.action == "FLAT":
             return
@@ -4226,32 +4624,44 @@ class TradingBot:
         ):
             return
 
-        performance_multiplier = self._get_performance_multiplier()
+        # Everything above is decided per-symbol, so it's settled here. The
+        # portfolio-level gates (max_positions, correlation caps, exposure
+        # budget) are NOT -- they depend on which other candidates win
+        # slots this cycle, so they're applied in _allocate_entries against
+        # a book that updates as entries are taken.
         confidence_multiplier = self.risk_manager.confidence_size_multiplier(signal.confidence)
         symbol_multiplier = self._get_symbol_performance_multiplier(symbol)
-        qty = self.risk_manager.position_size(
-            equity,
-            signal.price,
-            signal.atr,
-            performance_multiplier=performance_multiplier,
+        return EntryCandidate(
+            symbol=symbol,
+            signal=signal,
+            score=self._entry_score(signal, symbol_multiplier),
             confidence_multiplier=confidence_multiplier,
             symbol_multiplier=symbol_multiplier,
         )
-        if qty <= 0:
-            return
 
         current_exposure = portfolio.total_exposure
         qty = self.risk_manager.exposure_capped_qty(qty, signal.price, equity, current_exposure)
         if qty <= 0:
             self.logger.info(
-                f"[{symbol}] skip entry: no remaining portfolio exposure budget "
-                f"(current=${current_exposure:,.0f}, cap={self.config.max_total_exposure_pct:.0%} of equity)"
+                f"{len(ranked)} entry candidates for {slots_remaining} open slot(s) -- "
+                "taking highest expected-value first: "
+                + ", ".join(f"{c.symbol}({c.score:.3f})" for c in ranked[:slots_remaining + 3])
             )
-            return
 
-        if self.executor.has_open_orders(symbol):
-            self.logger.info(f"[{symbol}] already has open orders, skipping new entry")
-            return
+        # Local, mutable view of the book. Seeded from the broker's real
+        # positions, then updated as this cycle's entries are submitted.
+        held_symbols = list(open_positions.keys())
+        exposure = self._current_portfolio_exposure(open_positions)
+        performance_multiplier = self._get_performance_multiplier()
+        entries_submitted = 0
+
+        for candidate in ranked:
+            if slots_remaining <= 0:
+                self.logger.info(
+                    f"[{candidate.symbol}] skip entry: max_positions "
+                    f"({self.config.max_positions}) reached for this cycle"
+                )
+                break
 
         if self._submit_entry(symbol, signal, qty):
             portfolio.reserve_entry(symbol, qty * signal.price)
@@ -4345,6 +4755,13 @@ class TradingBot:
                     time.sleep(self.config.poll_interval_seconds)
                     continue
 
+                # A new calendar day re-anchors the daily-loss baseline and
+                # lifts yesterday's halt. Without this a continuously-running
+                # process keeps measuring against the first day it ever
+                # started and stays halted forever after one bad day.
+                if self.risk_manager.new_trading_day_started():
+                    self.halted = False
+
                 self.risk_manager.set_session_start_equity(equity)
 
                 if self.risk_manager.daily_loss_halt_triggered(equity):
@@ -4386,15 +4803,34 @@ class TradingBot:
                     continue
 
                 prefetched_bars = self._prefetch_bars(self.config.symbols)
+
+                # Phase 1 -- per-symbol work: manage every open position
+                # (exits, trailing stops, scale-outs happen immediately and
+                # are never deferred) and collect the symbols that qualify
+                # as entry candidates.
+                candidates: List[EntryCandidate] = []
                 for symbol in self.config.symbols:
                     try:
                         self._process_symbol(
                             symbol, equity, portfolio, minutes_to_close,
                             prefetched_bars.get(symbol, pd.DataFrame()),
                         )
+                        if candidate is not None:
+                            candidates.append(candidate)
                     except Exception as exc:
                         self.logger.error(f"[{symbol}] error while processing: {exc}")
                         self.logger.debug(traceback.format_exc())
+
+                # Phase 2 -- portfolio-level work: rank those candidates and
+                # spend the remaining slots on the best of them, enforcing
+                # max_positions / correlation / exposure against a book that
+                # updates as entries go out. Ranking only matters because
+                # this is deferred until every candidate is known.
+                try:
+                    self._allocate_entries(candidates, equity, open_positions)
+                except Exception as exc:
+                    self.logger.error(f"error while allocating entries: {exc}")
+                    self.logger.debug(traceback.format_exc())
 
                 self.journal.log_equity(equity, cash, len(open_positions))
                 self.fill_tracker.poll_and_record()
@@ -4463,7 +4899,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--backtest",
         action="store_true",
-        help="Run an offline backtest over historical data instead of live/paper trading.",
+        help="Run an offline PER-SYMBOL backtest over historical data instead of live/paper "
+             "trading. Each symbol gets its own independent equity and unlimited slots -- "
+             "the right tool for screening whether a symbol has an edge at all.",
+    )
+    parser.add_argument(
+        "--backtest-portfolio",
+        action="store_true",
+        help="Run an offline PORTFOLIO backtest: one shared account, max_positions slots "
+             "shared across the whole universe, correlation and exposure caps, and ranked "
+             "slot allocation -- i.e. what this bot would actually have made. Use this for "
+             "expected performance; use --backtest for per-symbol screening.",
     )
     parser.add_argument(
         "--report",
@@ -4542,6 +4988,58 @@ def build_config_from_args(args: argparse.Namespace) -> TradingConfig:
     return config
 
 
+def print_portfolio_backtest(summary: Dict, config: TradingConfig) -> None:
+    """Human-readable report for --backtest-portfolio, plus a CSV of the
+    per-symbol attribution and the equity curve for further analysis."""
+    bars_per_day = 26 if config.timeframe_unit == "Minute" else 1
+    n_bars = max(len(summary["equity_curve"]) - 1, 1)
+    approx_days = max(n_bars / bars_per_day, 1e-9)
+    total_return = summary["total_return"]
+    pnl = summary["final_equity"] - summary["starting_equity"]
+
+    print("=" * 72)
+    print("PORTFOLIO BACKTEST -- one shared account, competing for slots")
+    print("=" * 72)
+    print(f"  Symbols in universe   : {summary['n_symbols']}")
+    print(f"  Concurrent slots      : {config.max_positions}")
+    print(f"  Walk-forward folds    : {summary['n_folds']}")
+    print(f"  Out-of-sample bars    : {n_bars:,}  (~{approx_days:,.0f} trading days)")
+    print("-" * 72)
+    print(f"  Starting equity       : ${summary['starting_equity']:,.2f}")
+    print(f"  Final equity          : ${summary['final_equity']:,.2f}")
+    print(f"  Total return          : {total_return:+.2%}   (${pnl:+,.2f})")
+    print(f"  Avg P&L per day       : ${pnl / approx_days:+,.2f}")
+    print(f"  Trades                : {summary['n_trades']:,}")
+    print(f"  Win rate              : {summary['win_rate']:.2%}")
+    print(f"  Max drawdown          : {summary['max_drawdown']:.2%}")
+    print(f"  Sharpe (approx)       : {summary['sharpe_approx']:.2f}")
+    print(f"  Mean val accuracy     : {summary['mean_val_accuracy']:.3f}")
+    print("=" * 72)
+
+    per_symbol = summary.get("per_symbol")
+    if per_symbol is not None and len(per_symbol):
+        print("\nPer-symbol attribution (which symbols actually earned their slots):")
+        shown = per_symbol.copy()
+        shown["total_pnl"] = shown["total_pnl"].map(lambda v: f"${v:,.2f}")
+        shown["win_rate"] = shown["win_rate"].map(lambda v: f"{v:.2%}")
+        print(shown.to_string())
+
+        traded = set(per_symbol.index)
+        never = [s for s in config.symbols if s not in traded]
+        if never:
+            print(
+                f"\nNever traded ({len(never)}) -- always outranked for a slot, "
+                f"or never signalled: {', '.join(never)}"
+            )
+
+    out_dir = Path(config.log_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if per_symbol is not None and len(per_symbol):
+        per_symbol.to_csv(out_dir / "portfolio_backtest_per_symbol.csv")
+    summary["equity_curve"].to_csv(out_dir / "portfolio_backtest_equity_curve.csv", index=False)
+    print(f"\nWrote per-symbol attribution and equity curve to {out_dir}/")
+
+
 def print_model_status(config: TradingConfig, logger: logging.Logger) -> None:
     """Reads each configured symbol's cached model from disk and prints its
     training status and model-quality-gate state. No API calls -- local
@@ -4603,7 +5101,7 @@ def main() -> None:
         print_model_status(config, logger)
         return
 
-    if args.backtest:
+    if args.backtest or args.backtest_portfolio:
         if not config.api_key or not config.secret_key:
             raise SystemExit(
                 "Missing Alpaca API credentials for backtest. Set APCA_API_KEY_ID "
@@ -4615,6 +5113,13 @@ def main() -> None:
         backtester = Backtester(
             config, data_feed, FeatureEngineer(atr_percentile_window=config.atr_percentile_window), logger
         )
+
+        if args.backtest_portfolio:
+            summary = backtester.run_portfolio()
+            if summary:
+                print_portfolio_backtest(summary, config)
+            return
+
         results_df = backtester.run()
         if not results_df.empty:
             print(results_df.to_string(index=False))
