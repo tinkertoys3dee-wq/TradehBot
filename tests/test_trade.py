@@ -1,0 +1,270 @@
+import logging
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+import pandas as pd
+
+from Trade import (
+    Backtester,
+    FeatureEngineer,
+    MLSignalModel,
+    OrderClass,
+    OrderExecutor,
+    OrderSide,
+    PortfolioCycleState,
+    ScaleOutManager,
+    Signal,
+    SignalGenerator,
+    TradingBot,
+    TradingConfig,
+)
+
+
+def quiet_logger() -> logging.Logger:
+    logger = logging.getLogger("tradeh-tests")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    logger.setLevel(logging.CRITICAL)
+    return logger
+
+
+def synthetic_bars(count: int = 240) -> pd.DataFrame:
+    index = pd.date_range("2026-01-05 14:30", periods=count, freq="15min", tz="UTC")
+    base = 100 + np.sin(np.arange(count) / 9) * 0.5
+    return pd.DataFrame(
+        {
+            "open": base,
+            "high": base + 0.15,
+            "low": base - 0.15,
+            "close": base + np.sin(np.arange(count) / 5) * 0.03,
+            "volume": np.full(count, 100_000),
+        },
+        index=index,
+    )
+
+
+class TempConfigMixin:
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        root = Path(self.temp_dir.name)
+        self.config = TradingConfig(
+            symbols=["TEST"],
+            model_dir=str(root / "models"),
+            log_dir=str(root / "logs"),
+            state_dir=str(root / "state"),
+            min_bars_required=50,
+            market_context_enabled=False,
+            sector_context_enabled=False,
+            session_features_enabled=False,
+        )
+        self.logger = quiet_logger()
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+
+class ConfigValidationTests(unittest.TestCase):
+    def test_defaults_validate(self) -> None:
+        TradingConfig().validate()
+
+    def test_reports_multiple_unsafe_values(self) -> None:
+        config = TradingConfig(symbols=["AAPL", "aapl"], risk_per_trade_pct=-0.5)
+        errors = config.validation_errors()
+        self.assertTrue(any("duplicates" in error for error in errors))
+        self.assertTrue(any("risk_per_trade_pct" in error for error in errors))
+
+
+class FeatureEngineeringRegressionTests(TempConfigMixin, unittest.TestCase):
+    def test_unresolved_direction_labels_remain_nan(self) -> None:
+        frame = pd.DataFrame({"close": np.arange(10, dtype=float)})
+        labeled = FeatureEngineer().add_labels(frame, horizon=3)
+        self.assertTrue(labeled["target"].tail(3).isna().all())
+
+    def test_inference_timeline_is_not_filtered_by_future_label(self) -> None:
+        self.config.triple_barrier_labeling = True
+        self.config.label_barrier_atr_mult = 1_000.0
+        engineer = FeatureEngineer(atr_percentile_window=20)
+        features = engineer.build_feature_frame(synthetic_bars(), self.config)
+        labeled = engineer.label_feature_frame(features, self.config)
+
+        self.assertGreater(len(features), 100)
+        self.assertLess(len(labeled), len(features))
+        self.assertNotIn("target", features.columns)
+
+
+class ModelSafetyTests(TempConfigMixin, unittest.TestCase):
+    def test_one_class_training_data_is_rejected(self) -> None:
+        rows = self.config.min_bars_required
+        dataset = pd.DataFrame(
+            np.zeros((rows, len(FeatureEngineer.FEATURE_COLUMNS))),
+            columns=FeatureEngineer.FEATURE_COLUMNS,
+        )
+        dataset["target"] = 1
+        model = MLSignalModel("ONECLASS", self.config, self.logger)
+
+        self.assertFalse(model.train(dataset))
+        self.assertIsNone(model.pipeline)
+
+    def test_signal_stays_flat_below_validation_floor(self) -> None:
+        model = SimpleNamespace(last_val_accuracy=0.40)
+        row = pd.Series({"close": 100.0, "atr_14": 1.0})
+        signal = SignalGenerator(self.config, self.logger).generate("TEST", model, row)
+
+        self.assertEqual(signal.action, "FLAT")
+        self.assertIn("validation accuracy", signal.reason)
+
+
+class StaticSignalGenerator:
+    def generate(self, symbol, model, row, daily_trend=None):
+        return Signal(symbol, "BUY", 0.75, float(row["close"]), float(row["atr_14"]), "test")
+
+
+class BacktestChronologyTests(TempConfigMixin, unittest.TestCase):
+    def make_backtester(self) -> Backtester:
+        backtester = Backtester(self.config, SimpleNamespace(), FeatureEngineer(), self.logger)
+        backtester.signal_generator = StaticSignalGenerator()
+        return backtester
+
+    @staticmethod
+    def simulation_frame(count: int = 6) -> pd.DataFrame:
+        index = pd.date_range("2026-01-05 14:30", periods=count, freq="15min", tz="UTC")
+        return pd.DataFrame(
+            {
+                "open": 100.0,
+                "high": 100.1,
+                "low": 99.9,
+                "close": 100.0,
+                "atr_14": 1.0,
+            },
+            index=index,
+        )
+
+    def test_time_exit_uses_live_setting_and_current_bar(self) -> None:
+        self.config.time_exit_max_hold_bars = 2
+        self.config.backtest_spread_bps = 0
+        self.config.backtest_slippage_bps = 0
+        trades, _, _ = self.make_backtester()._simulate_trades(
+            "TEST", SimpleNamespace(), self.simulation_frame(), 100_000
+        )
+
+        self.assertEqual([trade["exit_reason"] for trade in trades], ["time_exit", "time_exit"])
+        self.assertEqual(trades[0]["entry_at"], self.simulation_frame().index[0])
+        self.assertEqual(trades[0]["exit_at"], self.simulation_frame().index[2])
+        self.assertEqual(trades[1]["entry_at"], self.simulation_frame().index[3])
+
+    def test_open_trade_is_realized_at_test_boundary(self) -> None:
+        self.config.enable_time_based_exit = False
+        trades, curve, ending_equity = self.make_backtester()._simulate_trades(
+            "TEST", SimpleNamespace(), self.simulation_frame(4), 100_000
+        )
+
+        self.assertEqual(len(trades), 1)
+        self.assertEqual(trades[0]["exit_reason"], "end_of_test_window")
+        self.assertEqual(curve[-1], ending_equity)
+
+    def test_embargo_is_measured_on_full_bar_timeline(self) -> None:
+        self.config.label_max_hold_bars = 4
+        index = pd.date_range("2026-01-05", periods=30, freq="15min", tz="UTC")
+        features = pd.DataFrame({"close": 100.0}, index=index)
+        labeled = pd.DataFrame({"target": 1}, index=index[::3])
+        training = self.make_backtester()._training_rows_before(features, labeled, 20)
+
+        self.assertTrue((training.index < index[16]).all())
+
+
+class PortfolioReservationTests(unittest.TestCase):
+    def test_reservations_count_slots_and_notional_once(self) -> None:
+        state = PortfolioCycleState(open_positions={}, open_exposure=100.0)
+        state.reserve_entry("AAPL", 250.0)
+        state.reserve_entry("AAPL", 200.0)
+
+        self.assertEqual(state.occupied_count, 1)
+        self.assertEqual(state.total_exposure, 350.0)
+
+        state.reserve_entry("AAPL", 300.0)
+        self.assertEqual(state.total_exposure, 400.0)
+
+    def test_existing_open_orders_are_reserved_before_processing(self) -> None:
+        bot = TradingBot.__new__(TradingBot)
+        bot.logger = quiet_logger()
+        bot.executor = SimpleNamespace(
+            get_open_orders=lambda: [
+                SimpleNamespace(symbol="PENDING", qty="4", limit_price="25"),
+                SimpleNamespace(symbol="FILLED", qty="2", limit_price="50"),
+            ]
+        )
+        positions = {"FILLED": SimpleNamespace(market_value="200")}
+
+        state = bot._build_portfolio_cycle_state(positions)
+
+        self.assertEqual(state.reserved_symbols, {"PENDING"})
+        self.assertEqual(state.occupied_count, 2)
+        self.assertEqual(state.total_exposure, 300.0)
+
+    def test_unknown_open_order_state_blocks_entries(self) -> None:
+        bot = TradingBot.__new__(TradingBot)
+        bot.logger = quiet_logger()
+        bot.executor = SimpleNamespace(get_open_orders=lambda: None)
+
+        state = bot._build_portfolio_cycle_state({})
+
+        self.assertFalse(state.entries_allowed)
+
+    def test_pending_market_order_with_unknown_price_blocks_more_exposure(self) -> None:
+        bot = TradingBot.__new__(TradingBot)
+        bot.logger = quiet_logger()
+        bot.executor = SimpleNamespace(
+            get_open_orders=lambda: [SimpleNamespace(symbol="MARKET", qty="4")]
+        )
+
+        state = bot._build_portfolio_cycle_state({})
+
+        self.assertTrue(np.isinf(state.total_exposure))
+
+
+class OrderProtectionTests(TempConfigMixin, unittest.TestCase):
+    def test_existing_position_protection_uses_closing_oco(self) -> None:
+        captured = []
+        client = SimpleNamespace(
+            submit_order=lambda request: captured.append(request) or SimpleNamespace(id="oco-1")
+        )
+        executor = OrderExecutor(client, self.config, self.logger)
+        order = executor.submit_oco_exit("TEST", 5, "BUY", 95.0, 110.0)
+
+        self.assertIsNotNone(order)
+        self.assertEqual(captured[0].order_class, OrderClass.OCO)
+        self.assertEqual(captured[0].side, OrderSide.SELL)
+        self.assertEqual(float(captured[0].take_profit.limit_price), 110.0)
+        self.assertEqual(float(captured[0].stop_loss.stop_price), 95.0)
+
+    def test_scale_out_never_opens_a_second_bracket(self) -> None:
+        calls = []
+
+        class FakeExecutor:
+            def cancel_orders_for_symbol(self, symbol):
+                return True
+
+            def close_partial_position(self, symbol, qty, position_side):
+                calls.append(("partial", symbol, qty, position_side))
+                return SimpleNamespace(id="partial-1")
+
+            def submit_oco_exit(self, symbol, qty, side, stop, take):
+                calls.append(("oco", symbol, qty, side, stop, take))
+                return SimpleNamespace(id="oco-1")
+
+            def submit_bracket_order(self, *args, **kwargs):
+                raise AssertionError("scale-out must not submit a new entry bracket")
+
+        manager = ScaleOutManager(self.config, FakeExecutor(), self.logger)
+        manager.register("TEST", "BUY", 10, 95.0, 105.0, 110.0)
+        manager.check_and_execute("TEST", 105.0)
+
+        self.assertEqual(calls[0][:3], ("partial", "TEST", 5))
+        self.assertEqual(calls[1][:4], ("oco", "TEST", 5, "BUY"))
+
+
+if __name__ == "__main__":
+    unittest.main()
