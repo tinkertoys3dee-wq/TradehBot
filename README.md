@@ -83,6 +83,7 @@ TradeH fails closed when account state is uncertain:
 
 - Missing paper credentials stop live and backtest startup.
 - An unavailable market clock is treated as market closed.
+- An unavailable filled-position snapshot blocks the entire trading cycle instead of treating the account as flat.
 - An unavailable open-order snapshot blocks new entries for that cycle while existing positions continue to be managed.
 - Accepted but unfilled entries reserve a position slot and estimated portfolio notional.
 - Stale bars, invalid features, weak validation accuracy, low confidence, and missing model state all produce `FLAT` decisions.
@@ -122,9 +123,11 @@ Configure persistent Railway volume paths with `railway_config.json`; the includ
 ## Tests
 
 ```bash
+python -m pip install -r requirements-dev.txt
+ruff check --select F,E9 Trade.py tests
 python -m py_compile Trade.py
 python Trade.py --validate-config
 python -m unittest discover -s tests -v
 ```
 
-The regression suite covers label leakage, continuous backtest chronology, fold embargoes, time exits, forced boundary liquidation, one-class model rejection, weak-model gating, pending-entry reservations, fail-closed order state, and closing OCO scale-out protection. GitHub Actions runs the same checks on every push and pull request.
+The regression suite covers label leakage, continuous backtest chronology, fold embargoes, time exits, forced boundary liquidation, one-class model rejection, weak-model gating, pending-entry reservations, ranked allocation, candidate collection, rejected submissions, fail-closed order state, and closing OCO scale-out protection. Ruff's undefined-name checks guard the live orchestration path against semantic-merge regressions that Python bytecode compilation cannot detect. GitHub Actions runs the same checks on every push and pull request.
