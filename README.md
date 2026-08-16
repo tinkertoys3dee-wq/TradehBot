@@ -86,6 +86,8 @@ TradeH fails closed when account state is uncertain:
 - An unavailable filled-position snapshot blocks the entire trading cycle instead of treating the account as flat.
 - An unavailable open-order snapshot blocks new entries for that cycle while existing positions continue to be managed.
 - Accepted but unfilled entries reserve a position slot and estimated portfolio notional.
+- TradeH tags its own entry parents with client order IDs and requests cancellation after 10 minutes unfilled, so stale limits cannot occupy every slot all day. A canceled order keeps its reservation until the next broker refresh confirms it is gone.
+- If an order-submission response is lost, TradeH reconciles the unique client order ID before deciding the order failed, preventing an accepted order from being submitted twice.
 - Stale bars, invalid features, weak validation accuracy, low confidence, and missing model state all produce `FLAT` decisions.
 - A persisted daily equity baseline prevents a restart from resetting the daily-loss limit.
 - Creating a file named `STOP_TRADING` asks the running bot to cancel orders, flatten positions, and stop.
@@ -130,4 +132,4 @@ python Trade.py --validate-config
 python -m unittest discover -s tests -v
 ```
 
-The regression suite covers label leakage, continuous backtest chronology, fold embargoes, time exits, forced boundary liquidation, one-class model rejection, weak-model gating, pending-entry reservations, ranked allocation, candidate collection, rejected submissions, fail-closed order state, and closing OCO scale-out protection. Ruff's undefined-name checks guard the live orchestration path against semantic-merge regressions that Python bytecode compilation cannot detect. GitHub Actions runs the same checks on every push and pull request.
+The regression suite covers label leakage, continuous backtest chronology, fold embargoes, time exits, forced boundary liquidation, one-class model rejection, weak-model gating, pending-entry reservations, stale-entry cancellation, lost-response reconciliation, gap-free fill polling, ranked allocation, candidate collection, rejected submissions, fail-closed order state, and closing OCO scale-out protection. Ruff's undefined-name checks guard the live orchestration path against semantic-merge regressions that Python bytecode compilation cannot detect. GitHub Actions runs the same checks on every push and pull request.
