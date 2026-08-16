@@ -135,6 +135,7 @@ import re
 import sys
 import time
 import traceback
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict, fields
 from datetime import datetime, timedelta, timezone
@@ -143,6 +144,12 @@ from typing import Optional, Dict, List, Set, Tuple
 
 import numpy as np
 import pandas as pd
+
+
+# Client-assigned IDs let TradeH distinguish its own entry parents from
+# protective bracket legs and orders placed manually in the same paper account.
+# Keep this stable across releases: outstanding orders may outlive a deploy.
+ENTRY_CLIENT_ORDER_ID_PREFIX = "tradeh-entry-"
 
 # --------------------------------------------------------------------------
 # Third-party ML deps
@@ -662,6 +669,13 @@ class TradingConfig:
     # actually oversized.
     entry_order_type: str = "limit"         # "market" or "limit"
     entry_limit_buffer_bps: float = 5.0     # how far through the reference price to allow
+    # A marketable limit that has not filled promptly is no longer the trade
+    # the model sized from the last closed bar. Cancel TradeH-owned entry
+    # parents after this long so stale orders cannot occupy every portfolio
+    # slot for the rest of the session. The current cycle keeps the slot
+    # reserved after requesting cancellation; capacity is released only after
+    # a later authoritative open-order refresh confirms it is gone.
+    entry_order_timeout_minutes: float = 10.0
 
     # --- Loop timing -----------------------------------------------------------
     poll_interval_seconds: int = 60
@@ -779,6 +793,8 @@ class TradingConfig:
              "time_exit_max_hold_bars must be > 0"),
             (is_number(self.max_concurrent_bar_fetches) and self.max_concurrent_bar_fetches > 0,
              "max_concurrent_bar_fetches must be > 0"),
+            (is_number(self.entry_order_timeout_minutes) and self.entry_order_timeout_minutes > 0,
+             "entry_order_timeout_minutes must be > 0"),
         ]
         for condition, message in numeric_checks:
             require(condition, message)
@@ -2397,11 +2413,98 @@ class OrderExecutor:
         none and accidentally exceeding position or exposure limits.
         """
         try:
-            req = GetOrdersRequest(status=QueryOrderStatus.OPEN)
+            # Roll multi-leg brackets up under their parent. For reservation
+            # and stale-entry handling we need the entry parent's timestamp,
+            # client_order_id, and full requested quantity—not separate stop
+            # and take-profit children.
+            req = GetOrdersRequest(status=QueryOrderStatus.OPEN, nested=True)
             return list(call_with_retry(self.client.get_orders, req, logger=self.logger))
         except Exception as exc:
             self.logger.error(f"Failed to fetch open orders after retries: {exc}")
             return None
+
+    def cancel_order_by_id(self, order_id: object) -> bool:
+        """Request cancellation of exactly one order without blind retries.
+
+        A cancellation response can be lost after Alpaca has accepted it, so
+        retrying the mutation may turn an ordinary race with a fill into noisy
+        repeated failures. Callers retain the order's risk reservation for the
+        current cycle and confirm the result from a later read snapshot.
+        """
+        if self.config.dry_run:
+            self.logger.info(f"[DRY RUN] Would cancel order {order_id}")
+            return True
+        try:
+            self.client.cancel_order_by_id(order_id)
+            return True
+        except Exception as exc:
+            self.logger.error(f"Failed to cancel order {order_id}: {exc}")
+            return False
+
+    def cancel_stale_entry_orders(
+        self,
+        open_orders: List[object],
+        open_position_symbols: Set[str],
+        now: Optional[datetime] = None,
+    ) -> List[str]:
+        """Cancel old, wholly-unfilled TradeH entry parents and return IDs.
+
+        Only orders carrying TradeH's stable client-ID prefix are eligible;
+        manual orders and protective orders are never touched. A partially
+        filled parent is also left alone even if the position snapshot has not
+        caught up yet. Successful requests remain reserved by the caller until
+        the next broker refresh confirms cancellation, preventing a
+        cancel/fill race from temporarily authorizing too much exposure.
+        """
+        now = now or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        cutoff = now - timedelta(minutes=self.config.entry_order_timeout_minutes)
+        cancel_requested: List[str] = []
+
+        for order in open_orders:
+            client_order_id = str(getattr(order, "client_order_id", "") or "")
+            if not client_order_id.startswith(ENTRY_CLIENT_ORDER_ID_PREFIX):
+                continue
+
+            symbol = str(getattr(order, "symbol", "") or "").upper()
+            if not symbol or symbol in open_position_symbols:
+                continue
+
+            try:
+                filled_qty = abs(float(getattr(order, "filled_qty", 0) or 0))
+            except (TypeError, ValueError):
+                # Unknown fill state is not safe to cancel automatically.
+                continue
+            if filled_qty > 0:
+                continue
+
+            submitted_at = (
+                getattr(order, "submitted_at", None)
+                or getattr(order, "created_at", None)
+            )
+            if not isinstance(submitted_at, datetime):
+                continue
+            if submitted_at.tzinfo is None:
+                submitted_at = submitted_at.replace(tzinfo=timezone.utc)
+            else:
+                submitted_at = submitted_at.astimezone(timezone.utc)
+            if submitted_at > cutoff:
+                continue
+
+            order_id = getattr(order, "id", None)
+            if order_id is None:
+                continue
+            age_minutes = (now - submitted_at).total_seconds() / 60.0
+            if self.cancel_order_by_id(order_id):
+                cancel_requested.append(str(order_id))
+                self.logger.warning(
+                    f"[{symbol}] requested cancellation of stale TradeH entry "
+                    f"{order_id} after {age_minutes:.1f} minutes unfilled; its slot "
+                    "remains reserved until the next broker refresh"
+                )
+
+        return cancel_requested
 
     def has_open_orders(self, symbol: str) -> bool:
         try:
@@ -2433,15 +2536,17 @@ class OrderExecutor:
             self.logger.error(f"[{symbol}] failed to fetch open stop legs: {exc}")
             return []
 
-    def get_recent_filled_orders(self, after: datetime, limit: int = 200) -> List[object]:
-        """Returns orders that reached a filled/closed status at or after `after`."""
+    def get_recent_filled_orders(
+        self, after: datetime, limit: int = 200
+    ) -> Optional[List[object]]:
+        """Return filled orders, or None when the broker read is unknown."""
         try:
             req = GetOrdersRequest(status=QueryOrderStatus.CLOSED, after=after, limit=limit)
             orders = call_with_retry(self.client.get_orders, req, logger=self.logger)
             return [o for o in orders if getattr(o, "filled_at", None) is not None]
         except Exception as exc:
             self.logger.error(f"Failed to fetch recent filled orders after retries: {exc}")
-            return []
+            return None
 
     def submit_bracket_order(
         self,
@@ -2467,6 +2572,10 @@ class OrderExecutor:
             return None
 
         order_side = OrderSide.BUY if side == "BUY" else OrderSide.SELL
+        client_order_id = (
+            f"{ENTRY_CLIENT_ORDER_ID_PREFIX}{symbol[:10]}-"
+            f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
+        )
         use_limit = self.config.entry_order_type == "limit" and reference_price is not None
         limit_price = None
         if use_limit:
@@ -2492,6 +2601,7 @@ class OrderExecutor:
                 side=order_side,
                 time_in_force=TimeInForce.DAY,
                 order_class=OrderClass.BRACKET,
+                client_order_id=client_order_id,
                 stop_loss=StopLossRequest(stop_price=stop_price),
                 take_profit=TakeProfitRequest(limit_price=take_price),
             )
@@ -2504,12 +2614,38 @@ class OrderExecutor:
             fill_desc = f"limit={limit_price}" if use_limit else "market"
             self.logger.info(
                 f"Submitted {side} bracket order: {qty} {symbol} @ {fill_desc} | "
-                f"stop={stop_price} take={take_price} | order_id={order.id}"
+                f"stop={stop_price} take={take_price} | order_id={order.id} "
+                f"client_order_id={client_order_id}"
             )
             return order
         except Exception as exc:
-            self.logger.error(f"[{symbol}] order submission failed: {exc}")
-            return None
+            # The POST may have reached Alpaca even when its response was
+            # lost. Because the request carries a unique client_order_id, a
+            # read-after-error can distinguish "accepted but response lost"
+            # from a true rejection without ever retrying the mutation.
+            self.logger.error(
+                f"[{symbol}] order submission returned an error: {exc}; "
+                f"reconciling client_order_id={client_order_id}"
+            )
+            try:
+                recovered = call_with_retry(
+                    self.client.get_order_by_client_id,
+                    client_order_id,
+                    max_attempts=2,
+                    base_delay=0.25,
+                    logger=self.logger,
+                )
+                self.logger.warning(
+                    f"[{symbol}] submission response was lost, but Alpaca confirms "
+                    f"the order exists as {recovered.id}; treating it as accepted"
+                )
+                return recovered
+            except Exception as reconcile_exc:
+                self.logger.error(
+                    f"[{symbol}] no accepted order found for {client_order_id}: "
+                    f"{reconcile_exc}"
+                )
+                return None
 
     def close_position(self, symbol: str) -> bool:
         if self.config.dry_run:
@@ -3026,9 +3162,22 @@ class FillTracker:
 
     def poll_and_record(self) -> int:
         """Fetches newly filled orders since the last poll and appends any
-        new ones to the fills ledger. Returns the number of new fills recorded."""
+        new ones to the fills ledger. Returns the number of new fills recorded.
+
+        The cursor advances only after a successful broker read, and advances
+        to the request start time rather than its completion time. That leaves
+        a harmless overlap (deduplicated by order ID) instead of a gap where a
+        fill arriving during the request could be skipped forever.
+        """
+        poll_started_at = datetime.now(timezone.utc)
         orders = self.executor.get_recent_filled_orders(self._last_poll)
-        self._last_poll = datetime.now(timezone.utc)
+        if orders is None:
+            self.logger.warning(
+                "Fill polling failed; retaining the previous cursor so no fills "
+                "are skipped when broker connectivity recovers"
+            )
+            return 0
+        self._last_poll = poll_started_at
 
         new_rows = []
         for order in orders:
@@ -4081,6 +4230,7 @@ class PortfolioCycleState:
     reserved_symbols: Set[str] = field(default_factory=set)
     reserved_exposure_by_symbol: Dict[str, float] = field(default_factory=dict)
     entries_allowed: bool = True
+    stale_entry_cancel_requests: int = 0
 
     @property
     def occupied_symbols(self) -> Set[str]:
@@ -4416,11 +4566,13 @@ class TradingBot:
         """Combine filled positions with pending entries before sizing.
 
         Open bracket children for symbols that already have a position are
-        protective orders, not new exposure, and are ignored here. For a
-        symbol without a filled position, an open order conservatively
-        reserves one slot. Its notional estimate uses the best available
-        order price; even when a market order has no price yet, the slot is
-        still reserved.
+        protective orders, not new exposure, and are ignored here. TradeH's
+        tagged entry parent is the exception: if it is only partially filled,
+        the still-open quantity remains reserved in addition to the filled
+        position's market value. For a symbol without a filled position, an
+        open order conservatively reserves one slot. Its notional estimate
+        uses the best available order price; even when a market order has no
+        price yet, the slot is still reserved.
         """
         state = PortfolioCycleState(
             open_positions=open_positions,
@@ -4435,14 +4587,37 @@ class TradingBot:
             )
             return state
 
+        cancel_stale = getattr(self.executor, "cancel_stale_entry_orders", None)
+        if cancel_stale is not None:
+            requested = cancel_stale(open_orders, set(open_positions))
+            state.stale_entry_cancel_requests = len(requested)
+
         for order in open_orders:
             symbol = str(getattr(order, "symbol", "") or "").upper()
-            if not symbol or symbol in open_positions:
+            if not symbol:
+                continue
+            client_order_id = str(getattr(order, "client_order_id", "") or "")
+            is_tradeh_entry = client_order_id.startswith(ENTRY_CLIENT_ORDER_ID_PREFIX)
+            if symbol in open_positions and not is_tradeh_entry:
                 continue
             try:
                 qty = abs(float(getattr(order, "qty", 0) or 0))
             except (TypeError, ValueError):
                 qty = 0.0
+            if qty <= 0:
+                pending_qty = float("inf")
+            elif is_tradeh_entry:
+                try:
+                    filled_qty = abs(float(getattr(order, "filled_qty", 0) or 0))
+                except (TypeError, ValueError):
+                    # Unknown remaining size means unknown exposure. Preserve
+                    # the slot and block further notional rather than guess.
+                    filled_qty = float("nan")
+                pending_qty = max(qty - filled_qty, 0.0) if np.isfinite(filled_qty) else float("inf")
+            else:
+                pending_qty = qty
+            if pending_qty <= 0:
+                continue
 
             price = 0.0
             for attr in ("limit_price", "filled_avg_price", "stop_price"):
@@ -4457,7 +4632,7 @@ class TradingBot:
             # notional is unknowable from this snapshot, so reserve infinite
             # exposure (blocking additional entries) rather than silently
             # counting it as $0 and weakening the portfolio cap.
-            estimated_notional = qty * price if price > 0 else float("inf")
+            estimated_notional = pending_qty * price if price > 0 else float("inf")
             state.reserve_entry(symbol, estimated_notional)
 
         if state.reserved_symbols:
@@ -4935,7 +5110,8 @@ class TradingBot:
                     f"symbols={len(self.config.symbols)} "
                     f"errors={len(symbol_errors)} candidates={len(candidates)} "
                     f"entries_submitted={entries_submitted} "
-                    f"positions={len(open_positions)} pending={len(portfolio.reserved_symbols)}"
+                    f"positions={len(open_positions)} pending={len(portfolio.reserved_symbols)} "
+                    f"stale_cancel_requests={portfolio.stale_entry_cancel_requests}"
                 )
 
                 self.journal.log_equity(equity, cash, len(open_positions))
@@ -4947,6 +5123,7 @@ class TradingBot:
                         "cash": cash,
                         "open_positions": len(open_positions),
                         "pending_entries": len(portfolio.reserved_symbols),
+                        "stale_entry_cancel_requests": portfolio.stale_entry_cancel_requests,
                         "occupied_slots": portfolio.occupied_count,
                         "entry_candidates": len(candidates),
                         "entries_submitted": entries_submitted,
@@ -4977,6 +5154,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lookback-days", type=int, default=None)
     parser.add_argument("--retrain-interval-minutes", type=int, default=None)
     parser.add_argument("--poll-interval-seconds", type=int, default=None)
+    parser.add_argument("--entry-order-timeout-minutes", type=float, default=None)
     parser.add_argument("--risk-per-trade-pct", type=float, default=None)
     parser.add_argument("--max-positions", type=int, default=None)
     parser.add_argument("--max-daily-loss-pct", type=float, default=None)
@@ -5080,6 +5258,7 @@ def build_config_from_args(args: argparse.Namespace) -> TradingConfig:
         "lookback_days": args.lookback_days,
         "retrain_interval_minutes": args.retrain_interval_minutes,
         "poll_interval_seconds": args.poll_interval_seconds,
+        "entry_order_timeout_minutes": args.entry_order_timeout_minutes,
         "risk_per_trade_pct": args.risk_per_trade_pct,
         "max_positions": args.max_positions,
         "max_daily_loss_pct": args.max_daily_loss_pct,
