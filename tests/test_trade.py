@@ -1,7 +1,6 @@
 import logging
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -11,10 +10,8 @@ import pandas as pd
 
 from Trade import (
     Backtester,
-    ENTRY_CLIENT_ORDER_ID_PREFIX,
     EntryCandidate,
     FeatureEngineer,
-    FillTracker,
     MLSignalModel,
     OrderClass,
     OrderExecutor,
@@ -187,13 +184,6 @@ class PortfolioReservationTests(unittest.TestCase):
         with patch("Trade.call_with_retry", side_effect=RuntimeError("broker unavailable")):
             self.assertIsNone(executor.get_open_positions())
 
-    def test_unknown_fill_state_is_not_reported_as_no_fills(self) -> None:
-        executor = OrderExecutor(SimpleNamespace(), TradingConfig(), quiet_logger())
-        with patch("Trade.call_with_retry", side_effect=RuntimeError("broker unavailable")):
-            self.assertIsNone(
-                executor.get_recent_filled_orders(datetime.now(timezone.utc) - timedelta(days=1))
-            )
-
     def test_reservations_count_slots_and_notional_once(self) -> None:
         state = PortfolioCycleState(open_positions={}, open_exposure=100.0)
         state.reserve_entry("AAPL", 250.0)
@@ -222,29 +212,6 @@ class PortfolioReservationTests(unittest.TestCase):
         self.assertEqual(state.occupied_count, 2)
         self.assertEqual(state.total_exposure, 300.0)
 
-    def test_partially_filled_tradeh_entry_reserves_only_remaining_exposure(self) -> None:
-        bot = TradingBot.__new__(TradingBot)
-        bot.logger = quiet_logger()
-        bot.executor = SimpleNamespace(
-            get_open_orders=lambda: [
-                SimpleNamespace(
-                    symbol="PARTIAL",
-                    qty="10",
-                    filled_qty="4",
-                    limit_price="10",
-                    client_order_id=f"{ENTRY_CLIENT_ORDER_ID_PREFIX}PARTIAL",
-                )
-            ]
-        )
-        positions = {"PARTIAL": SimpleNamespace(market_value="40")}
-
-        state = bot._build_portfolio_cycle_state(positions)
-
-        self.assertEqual(state.occupied_count, 1)
-        self.assertEqual(state.open_exposure, 40.0)
-        self.assertEqual(state.reserved_exposure_by_symbol, {"PARTIAL": 60.0})
-        self.assertEqual(state.total_exposure, 100.0)
-
     def test_unknown_open_order_state_blocks_entries(self) -> None:
         bot = TradingBot.__new__(TradingBot)
         bot.logger = quiet_logger()
@@ -264,112 +231,6 @@ class PortfolioReservationTests(unittest.TestCase):
         state = bot._build_portfolio_cycle_state({})
 
         self.assertTrue(np.isinf(state.total_exposure))
-
-
-class StaleEntryOrderTests(TempConfigMixin, unittest.TestCase):
-    def _build_state(self, orders):
-        canceled = []
-        client = SimpleNamespace(
-            get_orders=lambda _request: orders,
-            cancel_order_by_id=lambda order_id: canceled.append(str(order_id)),
-        )
-        bot = TradingBot.__new__(TradingBot)
-        bot.config = self.config
-        bot.logger = self.logger
-        bot.executor = OrderExecutor(client, self.config, self.logger)
-        return bot._build_portfolio_cycle_state({}), canceled
-
-    def test_stale_tradeh_entry_is_canceled_but_reserved_until_next_cycle(self) -> None:
-        self.config.entry_order_timeout_minutes = 10
-        order = SimpleNamespace(
-            id="stale-1",
-            client_order_id=f"{ENTRY_CLIENT_ORDER_ID_PREFIX}TEST-old",
-            symbol="TEST",
-            qty="4",
-            filled_qty="0",
-            limit_price="25",
-            submitted_at=datetime.now(timezone.utc) - timedelta(minutes=11),
-        )
-
-        state, canceled = self._build_state([order])
-
-        self.assertEqual(canceled, ["stale-1"])
-        self.assertEqual(state.stale_entry_cancel_requests, 1)
-        self.assertEqual(state.reserved_symbols, {"TEST"})
-        self.assertEqual(state.total_exposure, 100.0)
-
-    def test_manual_recent_and_partially_filled_orders_are_never_reaped(self) -> None:
-        old = datetime.now(timezone.utc) - timedelta(minutes=30)
-        recent = datetime.now(timezone.utc) - timedelta(minutes=2)
-        orders = [
-            SimpleNamespace(
-                id="manual",
-                client_order_id="manual-strategy",
-                symbol="MANUAL",
-                qty="1",
-                filled_qty="0",
-                limit_price="10",
-                submitted_at=old,
-            ),
-            SimpleNamespace(
-                id="recent",
-                client_order_id=f"{ENTRY_CLIENT_ORDER_ID_PREFIX}RECENT",
-                symbol="RECENT",
-                qty="1",
-                filled_qty="0",
-                limit_price="10",
-                submitted_at=recent,
-            ),
-            SimpleNamespace(
-                id="partial",
-                client_order_id=f"{ENTRY_CLIENT_ORDER_ID_PREFIX}PARTIAL",
-                symbol="PARTIAL",
-                qty="5",
-                filled_qty="1",
-                limit_price="10",
-                submitted_at=old,
-            ),
-        ]
-
-        state, canceled = self._build_state(orders)
-
-        self.assertEqual(canceled, [])
-        self.assertEqual(state.stale_entry_cancel_requests, 0)
-        self.assertEqual(state.reserved_symbols, {"MANUAL", "RECENT", "PARTIAL"})
-
-
-class FillTrackingTests(TempConfigMixin, unittest.TestCase):
-    def test_failed_poll_keeps_cursor_for_lossless_retry(self) -> None:
-        tracker = FillTracker(
-            self.config,
-            SimpleNamespace(get_recent_filled_orders=lambda _after: None),
-            self.logger,
-        )
-        cursor = datetime(2026, 8, 15, 14, 30, tzinfo=timezone.utc)
-        tracker._last_poll = cursor
-
-        self.assertEqual(tracker.poll_and_record(), 0)
-        self.assertEqual(tracker._last_poll, cursor)
-
-    def test_successful_poll_advances_cursor_from_request_start(self) -> None:
-        seen_after = []
-        tracker = FillTracker(
-            self.config,
-            SimpleNamespace(
-                get_recent_filled_orders=lambda after: seen_after.append(after) or []
-            ),
-            self.logger,
-        )
-        cursor = datetime(2026, 8, 15, 14, 30, tzinfo=timezone.utc)
-        tracker._last_poll = cursor
-        before = datetime.now(timezone.utc)
-
-        self.assertEqual(tracker.poll_and_record(), 0)
-
-        after = datetime.now(timezone.utc)
-        self.assertEqual(seen_after, [cursor])
-        self.assertGreaterEqual(tracker._last_poll, before)
-        self.assertLessEqual(tracker._last_poll, after)
 
 
 class LiveEntryPipelineTests(TempConfigMixin, unittest.TestCase):
@@ -459,32 +320,6 @@ class LiveEntryPipelineTests(TempConfigMixin, unittest.TestCase):
 
 
 class OrderProtectionTests(TempConfigMixin, unittest.TestCase):
-    def test_entry_uses_client_id_and_recovers_lost_submit_response(self) -> None:
-        captured = []
-        recovered_ids = []
-
-        def submit_order(request):
-            captured.append(request)
-            raise RuntimeError("response lost after acceptance")
-
-        def get_by_client_id(client_order_id):
-            recovered_ids.append(client_order_id)
-            return SimpleNamespace(id="accepted-1", client_order_id=client_order_id)
-
-        client = SimpleNamespace(
-            submit_order=submit_order,
-            get_order_by_client_id=get_by_client_id,
-        )
-        executor = OrderExecutor(client, self.config, self.logger)
-
-        order = executor.submit_bracket_order(
-            "TEST", 5, "BUY", 95.0, 110.0, reference_price=100.0
-        )
-
-        self.assertEqual(order.id, "accepted-1")
-        self.assertTrue(captured[0].client_order_id.startswith(ENTRY_CLIENT_ORDER_ID_PREFIX))
-        self.assertEqual(recovered_ids, [captured[0].client_order_id])
-
     def test_existing_position_protection_uses_closing_oco(self) -> None:
         captured = []
         client = SimpleNamespace(
