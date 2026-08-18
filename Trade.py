@@ -541,11 +541,39 @@ class TradingConfig:
     entry_ranking_enabled: bool = True
     stop_loss_atr_mult: float = 2.0
     take_profit_atr_mult: float = 3.0
-    # On by default: TrailingStopManager only ever tightens a resting stop
-    # (never loosens it), so this can only reduce give-back on winners --
-    # unlike partial scale-out, there's no failure mode where it leaves a
-    # position under-protected.
+    # TrailingStopManager only ever tightens a resting stop, never loosens
+    # it, so it cannot widen risk on an open trade. It CAN, however,
+    # destroy the strategy's reward:risk if it engages too early or trails
+    # too closely -- which is exactly what it was doing.
+    #
+    # 2026-08-10: the original version trailed at stop_loss_atr_mult (2.0)
+    # ATR behind price and activated IMMEDIATELY on entry (its "only
+    # tighten" check treats the first update as an improvement, since
+    # there is no previously-tracked stop to compare against). For the
+    # 3.0-ATR take-profit to ever be reached, price then had to travel
+    # 3.0 ATR without ever retracing 2.0 ATR from its running high -- a
+    # demanding path that mostly does not happen. So winners were cut
+    # short at partial gains while losers still ran the full 2.0 ATR to
+    # the original stop.
+    #
+    # The live fills confirm it: average win $29.84 vs average loss
+    # $30.34, i.e. ~1:1, against a configured 3.0/2.0 = 1.5:1. At 1:1 the
+    # breakeven win rate is 50% instead of 40%, and the model's real hit
+    # rate (~46-54%) sits right on that line -- which is why live trading
+    # bled while the backtest looked fine. The backtest never modeled the
+    # trailing stop at all, so it was measuring a different strategy than
+    # the one actually running.
+    #
+    # Now: trailing does not engage until the trade is
+    # trailing_stop_activation_atr_mult ATR in profit, and then trails
+    # trailing_stop_distance_atr_mult ATR behind. With 1.5/1.5 the first
+    # trail lands at roughly breakeven and tightens from there, so it
+    # protects gains without capping the trade before the take can pay.
+    # Both backtests model this identically now -- see
+    # Backtester._trailing_stop_for.
     trailing_stop: bool = True
+    trailing_stop_activation_atr_mult: float = 1.5   # profit needed before trailing starts
+    trailing_stop_distance_atr_mult: float = 1.5     # how far behind price to trail once active
 
     # --- Multi-timeframe trend confirmation --------------------------------
     require_daily_trend_confirmation: bool = True
@@ -2417,12 +2445,40 @@ class TrailingStopManager:
         a partial close never loosens back to the original stop."""
         return self._tracked_stops.get(symbol)
 
+    @staticmethod
+    def _entry_price(position: object) -> Optional[float]:
+        """
+        The position's average entry price, used to decide whether the
+        trade is far enough in profit for trailing to engage. Returns None
+        if the broker object doesn't expose a usable value, in which case
+        the caller falls back to trailing unconditionally (the old
+        behavior) rather than silently refusing to protect the position.
+        """
+        raw = getattr(position, "avg_entry_price", None)
+        try:
+            price = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return price if price > 0 else None
+
     def update(self, symbol: str, position: object, current_price: float, atr: float) -> None:
         if not self.config.trailing_stop or atr <= 0 or np.isnan(atr):
             return
 
         side = "BUY" if float(position.qty) > 0 else "SELL"
-        trail_dist = self.config.stop_loss_atr_mult * atr
+
+        # Don't trail until the trade is actually in profit by the
+        # activation distance. Trailing from the moment of entry (the old
+        # behavior) meant a normal retrace stopped winners out long before
+        # the take-profit could pay, collapsing reward:risk to ~1:1 -- see
+        # TradingConfig.trailing_stop for the live evidence.
+        entry_price = self._entry_price(position)
+        if entry_price is not None:
+            profit = (current_price - entry_price) if side == "BUY" else (entry_price - current_price)
+            if profit < self.config.trailing_stop_activation_atr_mult * atr:
+                return
+
+        trail_dist = self.config.trailing_stop_distance_atr_mult * atr
         candidate_stop = current_price - trail_dist if side == "BUY" else current_price + trail_dist
         rounded_candidate = round(candidate_stop, 2)
 
@@ -3093,6 +3149,42 @@ class Backtester:
         self.signal_generator = SignalGenerator(config, logger)
         self.risk_manager = RiskManager(config, logger)
 
+    def _trailing_stop_for(self, position: Dict, bar_high: float, bar_low: float, atr: float) -> float:
+        """
+        The trailing-stop level for an open simulated position, mirroring
+        TrailingStopManager exactly: nothing until the trade is
+        trailing_stop_activation_atr_mult ATR in profit, then trail
+        trailing_stop_distance_atr_mult ATR behind the best price seen,
+        and only ever tighten.
+
+        This exists because the backtest previously modeled a FIXED stop
+        while the live bot ran a trailing one, so the two were measuring
+        different strategies -- the backtest looked profitable while live
+        trading bled. Any change to trailing behavior has to move both
+        together or that gap reopens.
+
+        Trails from the bar's extreme rather than its close, matching the
+        live manager's behavior of trailing off whatever price it observes
+        (it polls intrabar, so it sees the highs/lows the close hides).
+        """
+        if not self.config.trailing_stop or atr <= 0:
+            return position["stop"]
+
+        entry = position["entry_price"]
+        long = position["side"] == "BUY"
+        best = max(position.get("best_price", entry), bar_high) if long \
+            else min(position.get("best_price", entry), bar_low)
+        position["best_price"] = best
+
+        profit = (best - entry) if long else (entry - best)
+        if profit < self.config.trailing_stop_activation_atr_mult * atr:
+            return position["stop"]
+
+        trail_dist = self.config.trailing_stop_distance_atr_mult * atr
+        candidate = (best - trail_dist) if long else (best + trail_dist)
+        # only ever tighten
+        return max(position["stop"], candidate) if long else min(position["stop"], candidate)
+
     def _cost_multiplier(self, side: str, is_entry: bool) -> float:
         """Applies half the round-trip spread+slippage cost on each leg."""
         bps = (self.config.backtest_spread_bps + self.config.backtest_slippage_bps) / 2.0
@@ -3122,6 +3214,13 @@ class Backtester:
 
             if position is not None:
                 position["bars_held"] += 1
+                # Ratchet the trailing stop off the PREVIOUS bar's extremes
+                # before testing this bar, so the stop level being tested is
+                # one the live bot could actually have set by now -- never a
+                # level derived from the same bar we're checking against.
+                position["stop"] = self._trailing_stop_for(
+                    position, float(row["high"]), float(row["low"]), float(row.get("atr_14", 0.0) or 0.0)
+                )
                 hit_stop = (
                     next_row["low"] <= position["stop"] if position["side"] == "BUY"
                     else next_row["high"] >= position["stop"]
@@ -3534,6 +3633,15 @@ class Backtester:
                         else None
                     )
                     if exit_price is None:
+                        # Position survived this bar -- ratchet its trailing
+                        # stop off THIS bar's extremes so the next bar is
+                        # tested against it. Doing it after the exit check
+                        # keeps the one-bar lag and avoids testing a bar
+                        # against a stop derived from that same bar.
+                        pos["stop"] = self._trailing_stop_for(
+                            pos, float(row["high"]), float(row["low"]),
+                            float(row.get("atr_14", 0.0) or 0.0),
+                        )
                         continue
 
                     effective_exit = exit_price * self._cost_multiplier(pos["side"], is_entry=False)
