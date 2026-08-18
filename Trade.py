@@ -3435,6 +3435,60 @@ class Backtester:
         self.signal_generator = SignalGenerator(config, logger)
         self.risk_manager = RiskManager(config, logger)
 
+    def _daily_trend_map(self, dataset: pd.DataFrame) -> Dict:
+        """
+        Reconstructs the higher-timeframe daily-trend filter from the
+        intraday bars the backtest already has, so the simulation applies
+        the same filter the live bot does.
+
+        Live, SignalGenerator blocks a BUY when the daily trend is DOWN and
+        a SELL when it is UP (AlpacaDataFeed.fetch_daily_trend: latest daily
+        close above/below its N-day SMA). The backtest passed
+        daily_trend=None, which disables the check entirely -- so the
+        backtest was taking trades the live bot refuses. The live logs show
+        that filter blocking 2-13% of otherwise-valid signals, i.e. the
+        backtest was validating a materially more permissive strategy than
+        the one running.
+
+        Returns {date -> "UP"/"DOWN"}, keyed by calendar date and shifted
+        one day forward so a bar only ever sees the PREVIOUS completed
+        day's trend. That shift matters: without it, a bar would be
+        filtered using a daily close from its own (not yet finished) day,
+        which is look-ahead.
+
+        Daily closes are the last intraday close of each session rather
+        than the official daily bar, which can differ slightly around
+        auctions -- acceptable for a filter that only asks "above or below
+        a 50-day average".
+        """
+        if not self.config.require_daily_trend_confirmation:
+            return {}
+        try:
+            daily_close = dataset["close"].resample("1D").last().dropna()
+        except (TypeError, ValueError):
+            return {}   # non-datetime index; skip rather than crash
+
+        period = self.config.daily_trend_sma_period
+        if len(daily_close) < period + 1:
+            return {}
+
+        sma = daily_close.rolling(period).mean()
+        trend = daily_close.gt(sma).map({True: "UP", False: "DOWN"}).where(sma.notna())
+        trend = trend.shift(1).dropna()   # only the previous completed day is visible
+        return {ts.date(): val for ts, val in trend.items()}
+
+    @staticmethod
+    def _trend_at(trend_map: Dict, ts) -> Optional[str]:
+        """Daily trend in effect for an intraday timestamp, or None when
+        unknown (which disables the filter for that bar, same as live when
+        the daily fetch returns nothing)."""
+        if not trend_map:
+            return None
+        try:
+            return trend_map.get(ts.date())
+        except AttributeError:
+            return None
+
     def _trailing_stop_for(self, position: Dict, bar_high: float, bar_low: float, atr: float) -> float:
         """
         The trailing-stop level for an open simulated position, mirroring
@@ -3479,7 +3533,8 @@ class Backtester:
         return (1 + cost_frac) if buying else (1 - cost_frac)
 
     def _simulate_trades(
-        self, symbol: str, model: MLSignalModel, test_df: pd.DataFrame, starting_equity: float
+        self, symbol: str, model: MLSignalModel, test_df: pd.DataFrame, starting_equity: float,
+        daily_trend_map: Optional[Dict] = None,
     ) -> Tuple[List[Dict], List[float], float]:
         """
         Walk every bar in the continuous out-of-sample feature timeline,
@@ -3566,7 +3621,10 @@ class Backtester:
             # Also avoid opening on the final bar only to force-close it
             # immediately below and pay two artificial transaction costs.
             if position is None and not exited_this_bar and i < len(test_df) - 1:
-                signal = self.signal_generator.generate(symbol, model, row, daily_trend=None)
+                signal = self.signal_generator.generate(
+                    symbol, model, row,
+                    daily_trend=self._trend_at(daily_trend_map, row.name),
+                )
                 if signal.action in ("BUY", "SELL"):
                     confidence_multiplier = self.risk_manager.confidence_size_multiplier(signal.confidence)
                     qty = self.risk_manager.position_size(
@@ -3730,7 +3788,10 @@ class Backtester:
             self._cleanup_backtest_model(model)
             return None
 
-        trades, equity_curve, ending_equity = self._simulate_trades(symbol, model, test_df, starting_equity)
+        trades, equity_curve, ending_equity = self._simulate_trades(
+            symbol, model, test_df, starting_equity,
+            daily_trend_map=self._daily_trend_map(dataset),
+        )
         result = self._build_result(
             symbol, trades, equity_curve, starting_equity, ending_equity, [model.last_val_accuracy]
         )
@@ -3794,6 +3855,9 @@ class Backtester:
         combined_equity_curve = [equity]
         combined_trades: List[Dict] = []
         fold_val_accuracies: List[float] = []
+        # Built once from the full feature timeline: the 50-day SMA needs
+        # far more history than any single fold contains.
+        daily_trend_map = self._daily_trend_map(features)
 
         fold_start = seed_end
         for fold_idx in range(n_folds):
@@ -3817,7 +3881,9 @@ class Backtester:
                 fold_start = fold_end
                 continue
 
-            trades, fold_equity_curve, equity = self._simulate_trades(symbol, model, test_df, equity)
+            trades, fold_equity_curve, equity = self._simulate_trades(
+                symbol, model, test_df, equity, daily_trend_map=daily_trend_map,
+            )
             combined_trades.extend(trades)
             combined_equity_curve.extend(fold_equity_curve[1:])  # drop duplicate leading point
             fold_val_accuracies.append(model.last_val_accuracy)
@@ -3921,6 +3987,10 @@ class Backtester:
             return {}
 
         # One combined, de-duplicated timeline across every symbol.
+        # Per-symbol daily-trend filter, built from each symbol's full
+        # timeline (the SMA needs far more history than one fold).
+        daily_trend_maps = {sym: self._daily_trend_map(df) for sym, df in datasets.items()}
+
         timeline = sorted(set().union(*(set(df.index) for df in datasets.values())))
         row_at: Dict[str, Dict] = {
             sym: {ts: i for i, ts in enumerate(df.index)} for sym, df in datasets.items()
@@ -4033,7 +4103,10 @@ class Backtester:
                         if idx is None:
                             continue
                         row = datasets[sym].iloc[idx]
-                        signal = self.signal_generator.generate(sym, model, row, daily_trend=None)
+                        signal = self.signal_generator.generate(
+                            sym, model, row,
+                            daily_trend=self._trend_at(daily_trend_maps.get(sym), ts),
+                        )
                         if signal.action not in ("BUY", "SELL"):
                             continue
                         # symbol_multiplier is pinned to 1.0 (neutral) here:
