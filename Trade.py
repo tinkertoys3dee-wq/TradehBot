@@ -539,38 +539,49 @@ class TradingConfig:
     stop_loss_atr_mult: float = 2.0
     take_profit_atr_mult: float = 3.0
     # TrailingStopManager only ever tightens a resting stop, never loosens
-    # it, so it cannot widen risk on an open trade. It CAN, however,
-    # destroy the strategy's reward:risk if it engages too early or trails
-    # too closely -- which is exactly what it was doing.
+    # it, so it cannot widen risk on an open trade. It CAN, however, change
+    # the strategy's realized reward:risk a lot, since it decides how much
+    # of a favorable move is kept.
     #
-    # 2026-08-10: the original version trailed at stop_loss_atr_mult (2.0)
-    # ATR behind price and activated IMMEDIATELY on entry (its "only
-    # tighten" check treats the first update as an improvement, since
-    # there is no previously-tracked stop to compare against). For the
-    # 3.0-ATR take-profit to ever be reached, price then had to travel
-    # 3.0 ATR without ever retracing 2.0 ATR from its running high -- a
-    # demanding path that mostly does not happen. So winners were cut
-    # short at partial gains while losers still ran the full 2.0 ATR to
-    # the original stop.
+    # These two knobs make that geometry explicit and tunable:
+    #   activation -- profit (in ATRs) required before trailing engages at
+    #                 all. 0.0 means "start trailing immediately on entry".
+    #   distance   -- how far behind the best price seen to trail, once
+    #                 engaged.
     #
-    # The live fills confirm it: average win $29.84 vs average loss
-    # $30.34, i.e. ~1:1, against a configured 3.0/2.0 = 1.5:1. At 1:1 the
-    # breakeven win rate is 50% instead of 40%, and the model's real hit
-    # rate (~46-54%) sits right on that line -- which is why live trading
-    # bled while the backtest looked fine. The backtest never modeled the
-    # trailing stop at all, so it was measuring a different strategy than
-    # the one actually running.
+    # Defaults reproduce the long-standing shipped behavior exactly
+    # (engage immediately, trail at stop_loss_atr_mult). That is a
+    # deliberate choice, not an endorsement: an attempt to "fix" this by
+    # delaying activation to +1.5 ATR and tightening the trail to 1.5 ATR
+    # was NOT supported by testing, so it is not imposed on live trading.
     #
-    # Now: trailing does not engage until the trade is
-    # trailing_stop_activation_atr_mult ATR in profit, and then trails
-    # trailing_stop_distance_atr_mult ATR behind. With 1.5/1.5 the first
-    # trail lands at roughly breakeven and tightens from there, so it
-    # protects gains without capping the trade before the take can pay.
-    # Both backtests model this identically now -- see
-    # Backtester._trailing_stop_for.
+    # What the evidence actually says, in full:
+    #   * Live fills (20 round trips) showed average win $29.84 vs average
+    #     loss $30.34 -- about 1:1 against a configured 3.0/2.0 = 1.5:1.
+    #     That looked like proof the trailing stop was capping winners, but
+    #     20 trades (6 wins) cannot support that conclusion.
+    #   * A model-driven backtest on trending synthetic bars ranked NO
+    #     trailing best, immediate-trailing second, and the +1.5/1.5
+    #     variant worst.
+    #   * A cleaner exit-policy experiment -- identical entries, only the
+    #     exit rule varying, ~5,900 trades per cell, autocorrelation swept
+    #     0.0 to 0.3 -- ranked it the opposite way: every trailing variant
+    #     beat no-trailing in every regime, and immediate vs +1.5/1.5 was a
+    #     wash (~0.003%/trade apart, each winning in different regimes).
+    # Two experiments, opposite conclusions. Synthetic data cannot settle
+    # this; only real bars can.
+    #
+    # The genuinely important fix here was not the geometry, it was that
+    # NEITHER backtest modeled trailing at all -- position["stop"] was set
+    # at entry and never moved. Live ran a trailing stop while the backtest
+    # measured a fixed one, so the two were not the same strategy, and the
+    # 34-symbol shortlist was selected under fixed-stop assumptions. Both
+    # backtests now model trailing identically to the live manager (see
+    # Backtester._trailing_stop_for), which is what finally makes these
+    # settings measurable on real data via --backtest-portfolio.
     trailing_stop: bool = True
-    trailing_stop_activation_atr_mult: float = 1.5   # profit needed before trailing starts
-    trailing_stop_distance_atr_mult: float = 1.5     # how far behind price to trail once active
+    trailing_stop_activation_atr_mult: float = 0.0   # 0.0 = engage immediately (shipped behavior)
+    trailing_stop_distance_atr_mult: float = 2.0     # == stop_loss_atr_mult (shipped behavior)
 
     # --- Multi-timeframe trend confirmation --------------------------------
     require_daily_trend_confirmation: bool = True
