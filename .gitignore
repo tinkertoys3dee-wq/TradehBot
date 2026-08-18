@@ -1,21 +1,19 @@
-# Python build artifacts
 __pycache__/
 *.py[cod]
-*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
 
-# Bot runtime output -- regenerated on every run, and models/state are
-# machine-specific (a cached model trained elsewhere should never be
-# treated as authoritative for this deployment).
+.env
+.env.*
+!.env.example
+
 logs/
 models/
 state/
-*.log
-backtest_results*.csv
-portfolio_backtest_*.csv
+STOP_TRADING
 
-# Local env / secrets. Alpaca credentials come from APCA_API_KEY_ID and
-# APCA_API_SECRET_KEY in the environment -- never commit them.
-.env
-.env.*
-venv/
-.venv/
+*.log
+.DS_Store

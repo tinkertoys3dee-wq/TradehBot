@@ -62,7 +62,7 @@ A self-contained, single-file algorithmic trading system that:
      Scale-out is now managed by ScaleOutManager: exactly one bracket
      order is ever open per symbol at any moment; a partial profit-take
      cancels it, submits a plain partial-close market order, then
-     immediately re-establishes a single fresh bracket on the remainder.
+     immediately establishes one closing OCO on the remainder.
      Defaults to OFF (config.enable_partial_scale_out) until you've
      watched the new mechanism work correctly for yourself.
 
@@ -135,17 +135,14 @@ import re
 import sys
 import time
 import traceback
-import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict, fields
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Set, Tuple
 
 import numpy as np
 import pandas as pd
-
-warnings.filterwarnings("ignore")
 
 # --------------------------------------------------------------------------
 # Third-party ML deps
@@ -160,7 +157,7 @@ try:
     from sklearn.pipeline import Pipeline
     from sklearn.preprocessing import StandardScaler
     from sklearn.model_selection import TimeSeriesSplit
-    from sklearn.metrics import accuracy_score, precision_score, roc_auc_score
+    from sklearn.metrics import accuracy_score, roc_auc_score
     from sklearn.calibration import CalibratedClassifierCV
     import joblib
 except ImportError as exc:  # pragma: no cover
@@ -742,6 +739,136 @@ class TradingConfig:
         """
         return self.label_max_hold_bars if self.triple_barrier_labeling else self.prediction_horizon_bars
 
+    def validation_errors(self) -> List[str]:
+        """Return every unsafe or internally inconsistent setting at once.
+
+        Configuration used to be accepted verbatim from JSON. A typo such
+        as a negative risk percentage, an impossible confidence threshold,
+        or an empty symbol universe therefore failed much later (sometimes
+        only after connecting to Alpaca). Keeping validation on the config
+        object makes every entry point -- live, backtest, and config dump --
+        share the same fail-fast safety checks.
+        """
+        errors: List[str] = []
+
+        def require(condition: bool, message: str) -> None:
+            if not condition:
+                errors.append(message)
+
+        def is_number(value: object) -> bool:
+            return isinstance(value, (int, float)) and not isinstance(value, bool) and np.isfinite(value)
+
+        require(self.paper is True, "paper must remain true; live trading is intentionally unsupported")
+        boolean_fields = [
+            "dry_run", "triple_barrier_labeling", "probability_calibration_enabled",
+            "market_context_enabled", "sector_context_enabled", "session_features_enabled",
+            "confidence_sizing_enabled", "enable_time_based_exit", "trailing_stop",
+            "require_daily_trend_confirmation", "adaptive_sizing_enabled",
+            "symbol_adaptive_sizing_enabled", "volatility_regime_filter_enabled",
+            "enable_partial_scale_out", "news_sentiment_enabled", "model_quality_gate_enabled",
+        ]
+        for field_name in boolean_fields:
+            require(isinstance(getattr(self, field_name), bool), f"{field_name} must be true or false")
+        require(bool(self.symbols), "symbols must contain at least one ticker")
+        if isinstance(self.symbols, list):
+            normalized = [str(symbol).strip().upper() for symbol in self.symbols]
+            require(all(re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,9}", symbol) for symbol in normalized),
+                    "symbols must be valid, non-empty ticker strings")
+            require(len(normalized) == len(set(normalized)), "symbols must not contain duplicates")
+        else:
+            errors.append("symbols must be a JSON array of ticker strings")
+
+        numeric_checks = [
+            (is_number(self.timeframe_amount) and self.timeframe_amount > 0, "timeframe_amount must be > 0"),
+            (is_number(self.lookback_days) and self.lookback_days > 0, "lookback_days must be > 0"),
+            (is_number(self.backtest_lookback_days) and self.backtest_lookback_days > 0,
+             "backtest_lookback_days must be > 0"),
+            (is_number(self.min_bars_required) and self.min_bars_required >= 50,
+             "min_bars_required must be >= 50"),
+            (is_number(self.prediction_horizon_bars) and self.prediction_horizon_bars > 0,
+             "prediction_horizon_bars must be > 0"),
+            (is_number(self.label_max_hold_bars) and self.label_max_hold_bars > 0,
+             "label_max_hold_bars must be > 0"),
+            (is_number(self.label_barrier_atr_mult) and self.label_barrier_atr_mult > 0,
+             "label_barrier_atr_mult must be > 0"),
+            (is_number(self.retrain_interval_minutes) and self.retrain_interval_minutes > 0,
+             "retrain_interval_minutes must be > 0"),
+            (is_number(self.poll_interval_seconds) and self.poll_interval_seconds > 0,
+             "poll_interval_seconds must be > 0"),
+            (is_number(self.max_positions) and self.max_positions > 0, "max_positions must be > 0"),
+            (is_number(self.max_positions_per_correlation_group)
+             and self.max_positions_per_correlation_group > 0,
+             "max_positions_per_correlation_group must be > 0"),
+            (is_number(self.stop_loss_atr_mult) and self.stop_loss_atr_mult > 0,
+             "stop_loss_atr_mult must be > 0"),
+            (is_number(self.take_profit_atr_mult) and self.take_profit_atr_mult > 0,
+             "take_profit_atr_mult must be > 0"),
+            (is_number(self.time_exit_max_hold_bars) and self.time_exit_max_hold_bars > 0,
+             "time_exit_max_hold_bars must be > 0"),
+            (is_number(self.max_concurrent_bar_fetches) and self.max_concurrent_bar_fetches > 0,
+             "max_concurrent_bar_fetches must be > 0"),
+        ]
+        for condition, message in numeric_checks:
+            require(condition, message)
+
+        require(self.timeframe_unit in {"Minute", "Hour", "Day"},
+                "timeframe_unit must be Minute, Hour, or Day")
+        require(is_number(self.min_train_accuracy) and 0.5 <= self.min_train_accuracy <= 1.0,
+                "min_train_accuracy must be in [0.5, 1.0]")
+        require(is_number(self.min_prediction_confidence) and 0.5 < self.min_prediction_confidence < 1.0,
+                "min_prediction_confidence must be between 0.5 and 1.0")
+        require(is_number(self.calibration_holdout_fraction)
+                and 0.0 < self.calibration_holdout_fraction < 0.5,
+                "calibration_holdout_fraction must be between 0 and 0.5")
+        require(self.calibration_method in {"sigmoid", "isotonic"},
+                "calibration_method must be sigmoid or isotonic")
+        require(is_number(self.risk_per_trade_pct) and 0.0 < self.risk_per_trade_pct <= 0.05,
+                "risk_per_trade_pct must be in (0, 0.05]")
+        require(is_number(self.max_position_pct_of_equity)
+                and 0.0 < self.max_position_pct_of_equity <= 1.0,
+                "max_position_pct_of_equity must be in (0, 1]")
+        require(is_number(self.max_total_exposure_pct) and 0.0 < self.max_total_exposure_pct <= 1.0,
+                "max_total_exposure_pct must be in (0, 1] for this no-leverage bot")
+        require(is_number(self.max_daily_loss_pct) and 0.0 < self.max_daily_loss_pct <= 0.25,
+                "max_daily_loss_pct must be in (0, 0.25]")
+        require(is_number(self.backtest_test_fraction) and 0.0 < self.backtest_test_fraction < 0.8,
+                "backtest_test_fraction must be between 0 and 0.8")
+        require(is_number(self.backtest_walkforward_folds) and self.backtest_walkforward_folds >= 0,
+                "backtest_walkforward_folds must be >= 0")
+        require(is_number(self.atr_percentile_min) and is_number(self.atr_percentile_max)
+                and 0.0 <= self.atr_percentile_min < self.atr_percentile_max <= 1.0,
+                "ATR percentile bounds must satisfy 0 <= min < max <= 1")
+        require(is_number(self.scale_out_fraction) and 0.0 < self.scale_out_fraction < 1.0,
+                "scale_out_fraction must be between 0 and 1")
+        require(self.entry_order_type in {"market", "limit"},
+                "entry_order_type must be market or limit")
+        require(is_number(self.entry_limit_buffer_bps) and self.entry_limit_buffer_bps >= 0,
+                "entry_limit_buffer_bps must be >= 0")
+        require(is_number(self.entry_cutoff_minutes_before_close)
+                and is_number(self.flatten_before_close_minutes)
+                and self.entry_cutoff_minutes_before_close >= self.flatten_before_close_minutes >= 0,
+                "entry cutoff must be >= flatten-before-close and both must be non-negative")
+        require(is_number(self.confidence_sizing_min_multiplier)
+                and self.confidence_sizing_min_multiplier > 0,
+                "confidence_sizing_min_multiplier must be > 0")
+        require(is_number(self.confidence_sizing_max_multiplier)
+                and is_number(self.confidence_sizing_min_multiplier)
+                and self.confidence_sizing_max_multiplier >= self.confidence_sizing_min_multiplier,
+                "confidence sizing max multiplier must be >= its min multiplier")
+        require(is_number(self.confidence_sizing_full_scale_at)
+                and is_number(self.min_prediction_confidence)
+                and self.confidence_sizing_full_scale_at > self.min_prediction_confidence,
+                "confidence_sizing_full_scale_at must exceed min_prediction_confidence")
+        require(is_number(self.max_combined_size_multiplier) and self.max_combined_size_multiplier > 0,
+                "max_combined_size_multiplier must be > 0")
+        return errors
+
+    def validate(self) -> None:
+        errors = self.validation_errors()
+        if errors:
+            details = "\n".join(f"  - {error}" for error in errors)
+            raise ValueError(f"Invalid trading configuration:\n{details}")
+
 
 # ==============================================================================
 # 2. LOGGING
@@ -768,6 +895,18 @@ def build_logger(log_dir: str) -> logging.Logger:
     logger.addHandler(file_handler)
 
     return logger
+
+
+def write_json_atomic(path: Path, payload: object) -> None:
+    """Replace a JSON state file atomically so a crash cannot truncate it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temp_path.write_text(json.dumps(payload, default=str))
+        os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
 
 
 # ==============================================================================
@@ -1316,7 +1455,14 @@ class FeatureEngineer:
         out = df.copy()
         if not triple_barrier:
             future_close = out["close"].shift(-horizon)
-            out["target"] = (future_close > out["close"]).astype(int)
+            # The final `horizon` rows do not have a knowable outcome. A
+            # pandas comparison against NaN evaluates False, which used to
+            # silently label every one of those rows as a down move and leak
+            # incomplete examples into training. Preserve them as NaN so the
+            # dataset cleaner drops them, just like unresolved triple-barrier
+            # rows.
+            out["target"] = (future_close > out["close"]).astype(float)
+            out.loc[future_close.isna(), "target"] = np.nan
             return out
 
         close = out["close"].to_numpy()
@@ -1351,13 +1497,21 @@ class FeatureEngineer:
         out["target"] = target
         return out
 
-    def build_dataset(
+    def build_feature_frame(
         self,
         raw_bars: pd.DataFrame,
         config: "TradingConfig",
         market_df: Optional[pd.DataFrame] = None,
         sector_df: Optional[pd.DataFrame] = None,
     ) -> pd.DataFrame:
+        """Build the continuous feature timeline used for live-like inference.
+
+        This deliberately does *not* require a target label. Backtests must
+        walk every chronologically available feature row, including quiet
+        rows whose future path never hits a triple barrier. Filtering the
+        test timeline by target availability would select rows using future
+        information and materially overstate performance.
+        """
         feats = self.add_features(
             raw_bars,
             market_df=market_df,
@@ -1366,20 +1520,41 @@ class FeatureEngineer:
         )
         if feats.empty:
             return feats
+        cols_needed = self.FEATURE_COLUMNS + ["atr_14", "open", "high", "low", "close"]
+        return feats.dropna(subset=cols_needed).copy()
+
+    def label_feature_frame(
+        self, feature_frame: pd.DataFrame, config: "TradingConfig"
+    ) -> pd.DataFrame:
+        """Create a training-only labeled view of a clean feature frame."""
+        if feature_frame.empty:
+            return feature_frame.copy()
         if config.triple_barrier_labeling:
             labeled = self.add_labels(
-                feats,
+                feature_frame,
                 config.prediction_horizon_bars,
                 triple_barrier=True,
                 barrier_atr_mult=config.label_barrier_atr_mult,
                 max_hold=config.label_max_hold_bars,
             )
         else:
-            labeled = self.add_labels(feats, config.prediction_horizon_bars)
+            labeled = self.add_labels(feature_frame, config.prediction_horizon_bars)
         cols_needed = self.FEATURE_COLUMNS + ["target", "atr_14", "close"]
-        labeled = labeled.dropna(subset=cols_needed)
+        labeled = labeled.dropna(subset=cols_needed).copy()
         labeled["target"] = labeled["target"].astype(int)
         return labeled
+
+    def build_dataset(
+        self,
+        raw_bars: pd.DataFrame,
+        config: "TradingConfig",
+        market_df: Optional[pd.DataFrame] = None,
+        sector_df: Optional[pd.DataFrame] = None,
+    ) -> pd.DataFrame:
+        feature_frame = self.build_feature_frame(
+            raw_bars, config, market_df=market_df, sector_df=sector_df
+        )
+        return self.label_feature_frame(feature_frame, config)
 
 
 # ==============================================================================
@@ -1526,7 +1701,15 @@ class MLSignalModel:
             "feature_columns": FeatureEngineer.FEATURE_COLUMNS,
             "accuracy_history": self.accuracy_history,
         }
-        joblib.dump(payload, self.model_path)
+        temp_path = self.model_path.with_name(
+            f".{self.model_path.name}.{os.getpid()}.tmp"
+        )
+        try:
+            joblib.dump(payload, temp_path, compress=3)
+            os.replace(temp_path, self.model_path)
+        finally:
+            if temp_path.exists():
+                temp_path.unlink()
 
     def has_edge(self, min_avg_accuracy: float) -> bool:
         """
@@ -1575,6 +1758,13 @@ class MLSignalModel:
         y = dataset["target"].values
         embargo = self.config.label_horizon_bars()
 
+        if len(np.unique(y)) < 2:
+            self.logger.warning(
+                f"[{self.symbol}] training data contains only one target class; "
+                "keeping the previous model (if any) and staying flat"
+            )
+            return False
+
         splitter = TimeSeriesSplit(n_splits=5)
         fold_accuracies, fold_aucs = [], []
 
@@ -1603,6 +1793,13 @@ class MLSignalModel:
 
         val_accuracy = float(np.mean(fold_accuracies)) if fold_accuracies else 0.0
         val_auc = float(np.mean(fold_aucs)) if fold_aucs else 0.5
+
+        if not fold_accuracies:
+            self.logger.warning(
+                f"[{self.symbol}] no valid chronological validation folds were available; "
+                "keeping the previous model (if any) and staying flat"
+            )
+            return False
 
         final_pipeline, pipeline_for_importance = self._fit_production_pipeline(X, y, embargo)
 
@@ -1834,6 +2031,17 @@ class SignalGenerator:
         price = float(feature_row["close"])
         atr = float(feature_row["atr_14"])
 
+        if model.last_val_accuracy < self.config.min_train_accuracy:
+            return Signal(
+                symbol,
+                "FLAT",
+                0.0,
+                price,
+                atr,
+                f"model validation accuracy {model.last_val_accuracy:.3f} below "
+                f"floor {self.config.min_train_accuracy:.3f}",
+            )
+
         if atr <= 0 or np.isnan(atr):
             return Signal(symbol, "FLAT", 0.0, price, atr, "invalid ATR")
 
@@ -1961,7 +2169,7 @@ class RiskManager:
     def _save_daily_state(self) -> None:
         payload = {"date": self._today_key(), "session_start_equity": self.session_start_equity}
         try:
-            self.state_path.write_text(json.dumps(payload))
+            write_json_atomic(self.state_path, payload)
         except Exception as exc:
             self.logger.warning(f"Failed to persist daily state: {exc}")
 
@@ -2202,6 +2410,21 @@ class OrderExecutor:
             self.logger.error(f"Failed to fetch positions after retries: {exc}")
             return {}
 
+    def get_open_orders(self) -> Optional[List[object]]:
+        """Return every open order, or None when order state is unknown.
+
+        The distinction between an empty list and None is intentional. If
+        Alpaca cannot tell us which entries are already pending, the live
+        loop blocks new entries for that cycle instead of assuming there are
+        none and accidentally exceeding position or exposure limits.
+        """
+        try:
+            req = GetOrdersRequest(status=QueryOrderStatus.OPEN)
+            return list(call_with_retry(self.client.get_orders, req, logger=self.logger))
+        except Exception as exc:
+            self.logger.error(f"Failed to fetch open orders after retries: {exc}")
+            return None
+
     def has_open_orders(self, symbol: str) -> bool:
         try:
             req = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])
@@ -2335,7 +2558,7 @@ class OrderExecutor:
     def cancel_orders_for_symbol(self, symbol: str) -> bool:
         """
         Cancels every open order for `symbol`. Used before re-protecting a
-        position with a fresh bracket order (see ScaleOutManager) so there
+        position with a fresh closing OCO (see ScaleOutManager) so there
         is never more than one stop-loss + one take-profit resting at once
         for a given symbol. Deliberately NOT wrapped in call_with_retry --
         same order-mutation safety reasoning as elsewhere: a failed cancel
@@ -2366,7 +2589,7 @@ class OrderExecutor:
         bracket for a partial exit is exactly what caused the overlapping-
         protection bug this method exists to avoid (see ScaleOutManager).
         Caller is responsible for cancelling any existing protective orders
-        first and re-establishing a single fresh bracket for the remainder.
+        first and establishing one closing OCO for the remainder.
         """
         if qty <= 0:
             return None
@@ -2384,6 +2607,50 @@ class OrderExecutor:
             return order
         except Exception as exc:
             self.logger.error(f"[{symbol}] partial close order failed: {exc}")
+            return None
+
+    def submit_oco_exit(
+        self,
+        symbol: str,
+        qty: int,
+        position_side: str,
+        stop_price: float,
+        take_price: float,
+    ) -> Optional[object]:
+        """Protect an *existing* position with one closing OCO order.
+
+        A bracket order is an entry plus two exit legs; using one to
+        "re-protect" shares already held actually adds to the position. An
+        OCO order contains only the two opposite-side exits, which is the
+        correct Alpaca primitive after a partial close.
+        """
+        if qty <= 0:
+            return None
+        closing_side = OrderSide.SELL if position_side == "BUY" else OrderSide.BUY
+        if self.config.dry_run:
+            self.logger.info(
+                f"[DRY RUN] Would submit closing OCO for {qty} {symbol} | "
+                f"stop={stop_price} take={take_price}"
+            )
+            return None
+        try:
+            request = LimitOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=closing_side,
+                time_in_force=TimeInForce.DAY,
+                order_class=OrderClass.OCO,
+                take_profit=TakeProfitRequest(limit_price=take_price),
+                stop_loss=StopLossRequest(stop_price=stop_price),
+            )
+            order = self.client.submit_order(request)
+            self.logger.info(
+                f"[{symbol}] closing OCO submitted for {qty} share(s) | "
+                f"stop={stop_price} take={take_price} | order_id={order.id}"
+            )
+            return order
+        except Exception as exc:
+            self.logger.error(f"[{symbol}] closing OCO submission failed: {exc}")
             return None
 
     def replace_stop_order(self, order_id: str, new_stop_price: float) -> bool:
@@ -2520,8 +2787,8 @@ class ScaleOutManager:
     qty), then on each poll cycle checks whether price has reached the
     near target -- if so, cancels the single resting bracket, submits a
     plain market order to partially close the position, and immediately
-    re-establishes a single fresh bracket order protecting the remaining
-    shares at the full stop/take levels.
+    establishes one closing OCO protecting the remaining shares at the
+    full stop/take levels.
 
     This exists specifically to avoid a bug in an earlier version of this
     script, which submitted two independent bracket orders per entry to
@@ -2589,11 +2856,14 @@ class ScaleOutManager:
         # one state this manager must never leave sitting for long.
         if plan["needs_reprotection"]:
             stop_to_use = effective_stop_price or plan["stop_price"]
-            new_bracket = self.executor.submit_bracket_order(
-                symbol, plan["qty_remaining_after"], side, stop_to_use, plan["full_take_price"],
-                reference_price=current_price,
+            new_oco = self.executor.submit_oco_exit(
+                symbol,
+                plan["qty_remaining_after"],
+                side,
+                stop_to_use,
+                plan["full_take_price"],
             )
-            if new_bracket is not None or self.config.dry_run:
+            if new_oco is not None or self.config.dry_run:
                 plan["needs_reprotection"] = False
                 plan["scaled"] = True
                 self.logger.info(f"[{symbol}] re-protection retry succeeded after a prior scale-out failure")
@@ -2627,19 +2897,24 @@ class ScaleOutManager:
                 f"re-establishing full protection on the original quantity immediately"
             )
             fallback_qty = plan["qty_to_take_at_near_target"] + plan["qty_remaining_after"]
-            self.executor.submit_bracket_order(
-                symbol, fallback_qty, side,
-                effective_stop_price or plan["stop_price"], plan["full_take_price"],
-                reference_price=current_price,
+            self.executor.submit_oco_exit(
+                symbol,
+                fallback_qty,
+                side,
+                effective_stop_price or plan["stop_price"],
+                plan["full_take_price"],
             )
             return  # not marked scaled -- will simply retry the whole sequence next cycle
 
         stop_to_use = effective_stop_price or plan["stop_price"]
-        new_bracket = self.executor.submit_bracket_order(
-            symbol, plan["qty_remaining_after"], side, stop_to_use, plan["full_take_price"],
-            reference_price=current_price,
+        new_oco = self.executor.submit_oco_exit(
+            symbol,
+            plan["qty_remaining_after"],
+            side,
+            stop_to_use,
+            plan["full_take_price"],
         )
-        if new_bracket is None and not self.config.dry_run:
+        if new_oco is None and not self.config.dry_run:
             self.logger.error(
                 f"[{symbol}] CRITICAL: partial close succeeded but re-establishing protection on the "
                 f"remaining {plan['qty_remaining_after']} share(s) failed -- position may be UNPROTECTED "
@@ -2651,7 +2926,7 @@ class ScaleOutManager:
         plan["scaled"] = True
         self.logger.info(
             f"[{symbol}] scale-out complete: took profit on partial qty, remaining "
-            f"{plan['qty_remaining_after']} share(s) re-protected with a fresh bracket "
+            f"{plan['qty_remaining_after']} share(s) re-protected with a closing OCO "
             f"(stop={stop_to_use}, take={plan['full_take_price']})"
         )
 
@@ -2795,7 +3070,7 @@ class FillTracker:
     def _save_seen_ids(self) -> None:
         try:
             trimmed = list(self._seen_ids)[-5000:]  # cap file growth
-            self.seen_ids_path.write_text(json.dumps(trimmed))
+            write_json_atomic(self.seen_ids_path, trimmed)
         except Exception as exc:
             self.logger.debug(f"Failed to persist seen fill ids: {exc}")
 
@@ -3196,9 +3471,18 @@ class Backtester:
         self, symbol: str, model: MLSignalModel, test_df: pd.DataFrame, starting_equity: float
     ) -> Tuple[List[Dict], List[float], float]:
         """
-        Walks bar-by-bar through `test_df` (already-featured/labeled rows,
-        chronologically ordered) simulating entries/exits against a trained
-        `model`, using the same signal/risk logic as everywhere else.
+        Walk every bar in the continuous out-of-sample feature timeline,
+        using the same signal/risk logic as live trading. Target labels are
+        intentionally absent here: their availability depends on future
+        price action and must never decide which bars a backtest visits.
+
+        Position management happens on the current bar before a new signal
+        is considered at that bar's close. The previous implementation
+        checked exits against the *next* bar and then could open a replacement
+        using the previous row, effectively backdating the new entry by one
+        bar. It also hard-coded prediction_horizon_bars * 3 for time exits,
+        diverging from the live time_exit_max_hold_bars setting.
+
         Shared by both the single-split and walk-forward backtest paths so
         the simulation itself is never maintained in two places. Returns
         (trades, equity_curve, ending_equity).
@@ -3208,9 +3492,9 @@ class Backtester:
         position: Optional[Dict] = None
         trades: List[Dict] = []
 
-        for i in range(len(test_df) - 1):
+        for i in range(len(test_df)):
             row = test_df.iloc[i]
-            next_row = test_df.iloc[i + 1]
+            exited_this_bar = False
 
             if position is not None:
                 position["bars_held"] += 1
@@ -3222,22 +3506,29 @@ class Backtester:
                     position, float(row["high"]), float(row["low"]), float(row.get("atr_14", 0.0) or 0.0)
                 )
                 hit_stop = (
-                    next_row["low"] <= position["stop"] if position["side"] == "BUY"
-                    else next_row["high"] >= position["stop"]
+                    row["low"] <= position["stop"] if position["side"] == "BUY"
+                    else row["high"] >= position["stop"]
                 )
                 hit_take = (
-                    next_row["high"] >= position["take"] if position["side"] == "BUY"
-                    else next_row["low"] <= position["take"]
+                    row["high"] >= position["take"] if position["side"] == "BUY"
+                    else row["low"] <= position["take"]
                 )
-                time_exit = position["bars_held"] >= self.config.prediction_horizon_bars * 3
+                time_exit = (
+                    self.config.enable_time_based_exit
+                    and position["bars_held"] >= self.config.time_exit_max_hold_bars
+                )
 
                 exit_price = None
+                exit_reason = ""
                 if hit_stop:
                     exit_price = position["stop"]
+                    exit_reason = "stop"
                 elif hit_take:
                     exit_price = position["take"]
+                    exit_reason = "take_profit"
                 elif time_exit:
-                    exit_price = next_row["close"]
+                    exit_price = row["close"]
+                    exit_reason = "time_exit"
 
                 if exit_price is not None:
                     cost_mult = self._cost_multiplier(position["side"], is_entry=False)
@@ -3252,10 +3543,18 @@ class Backtester:
                         "entry_price": position["entry_price"],
                         "exit_price": effective_exit,
                         "pnl": pnl,
+                        "entry_at": position["entry_at"],
+                        "exit_at": row.name,
+                        "exit_reason": exit_reason,
                     })
                     position = None
+                    exited_this_bar = True
 
-            if position is None:
+            # Match the live loop's behavior: after an exit it waits for the
+            # next cycle rather than closing and reopening on the same bar.
+            # Also avoid opening on the final bar only to force-close it
+            # immediately below and pay two artificial transaction costs.
+            if position is None and not exited_this_bar and i < len(test_df) - 1:
                 signal = self.signal_generator.generate(symbol, model, row, daily_trend=None)
                 if signal.action in ("BUY", "SELL"):
                     confidence_multiplier = self.risk_manager.confidence_size_multiplier(signal.confidence)
@@ -3273,9 +3572,33 @@ class Backtester:
                             "stop": stop,
                             "take": take,
                             "bars_held": 0,
+                            "entry_at": row.name,
                         }
 
             equity_curve.append(equity)
+
+        # Never let an open trade vanish at a fold/test boundary. Realize it
+        # at the final close so ending equity, trade count, and the next
+        # walk-forward fold all begin from an honest, flat account state.
+        if position is not None and not test_df.empty:
+            final_row = test_df.iloc[-1]
+            cost_mult = self._cost_multiplier(position["side"], is_entry=False)
+            effective_exit = float(final_row["close"]) * cost_mult
+            direction = 1 if position["side"] == "BUY" else -1
+            pnl = direction * position["qty"] * (effective_exit - position["entry_price"])
+            equity += pnl
+            trades.append({
+                "symbol": symbol,
+                "side": position["side"],
+                "qty": position["qty"],
+                "entry_price": position["entry_price"],
+                "exit_price": effective_exit,
+                "pnl": pnl,
+                "entry_at": position["entry_at"],
+                "exit_at": final_row.name,
+                "exit_reason": "end_of_test_window",
+            })
+            equity_curve[-1] = equity
 
         return trades, equity_curve, equity
 
@@ -3318,6 +3641,38 @@ class Backtester:
         except Exception:
             pass
 
+    def _prepare_backtest_frames(
+        self,
+        raw_bars: pd.DataFrame,
+        market_df: Optional[pd.DataFrame],
+        sector_df: Optional[pd.DataFrame],
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Return (continuous inference features, training-only labels)."""
+        features = self.feature_engineer.build_feature_frame(
+            raw_bars, self.config, market_df=market_df, sector_df=sector_df
+        )
+        labeled = self.feature_engineer.label_feature_frame(features, self.config)
+        return features, labeled
+
+    def _training_rows_before(
+        self,
+        features: pd.DataFrame,
+        labeled: pd.DataFrame,
+        test_start_position: int,
+    ) -> pd.DataFrame:
+        """Select labels strictly before an embargoed OOS boundary.
+
+        The embargo is measured on the full bar timeline rather than on the
+        sparse triple-barrier label frame. This guarantees that a training
+        target cannot have looked into the out-of-sample fold even when many
+        unresolved/choppy training rows were dropped.
+        """
+        embargo_start = test_start_position - self.config.label_horizon_bars()
+        if embargo_start <= 0:
+            return labeled.iloc[0:0]
+        cutoff_timestamp = features.index[embargo_start]
+        return labeled.loc[labeled.index < cutoff_timestamp]
+
     def run_symbol(
         self,
         symbol: str,
@@ -3339,24 +3694,29 @@ class Backtester:
             self.logger.warning(f"[{symbol}] no historical bars for backtest")
             return None
 
-        dataset = self.feature_engineer.build_dataset(
-            raw_bars, self.config, market_df=market_df, sector_df=sector_df
-        )
-        if len(dataset) < self.config.min_bars_required:
-            self.logger.warning(f"[{symbol}] not enough bars for a meaningful backtest")
+        features, labeled = self._prepare_backtest_frames(raw_bars, market_df, sector_df)
+        if len(features) < self.config.min_bars_required + 30:
+            self.logger.warning(f"[{symbol}] not enough continuous feature bars for a meaningful backtest")
             return None
 
-        split_idx = int(len(dataset) * (1 - self.config.backtest_test_fraction))
-        train_df = dataset.iloc[:split_idx]
-        test_df = dataset.iloc[split_idx:]
+        split_idx = int(len(features) * (1 - self.config.backtest_test_fraction))
+        train_df = self._training_rows_before(features, labeled, split_idx)
+        test_df = features.iloc[split_idx:]
+        if len(train_df) < self.config.min_bars_required:
+            self.logger.warning(
+                f"[{symbol}] not enough labeled training rows before the embargoed test window "
+                f"({len(train_df)} < {self.config.min_bars_required})"
+            )
+            return None
         if len(test_df) < 30:
             self.logger.warning(f"[{symbol}] test window too short, adjust backtest_test_fraction")
             return None
 
         model = MLSignalModel(f"{symbol}_backtest", self.config, self.logger)
-        model.train(train_df)
-        if model.pipeline is None:
+        trained_ok = model.train(train_df)
+        if not trained_ok or model.pipeline is None:
             self.logger.warning(f"[{symbol}] backtest model failed to train")
+            self._cleanup_backtest_model(model)
             return None
 
         trades, equity_curve, ending_equity = self._simulate_trades(symbol, model, test_df, starting_equity)
@@ -3398,16 +3758,14 @@ class Backtester:
             self.logger.warning(f"[{symbol}] no historical bars for backtest")
             return None
 
-        dataset = self.feature_engineer.build_dataset(
-            raw_bars, self.config, market_df=market_df, sector_df=sector_df
-        )
-        if len(dataset) < self.config.min_bars_required:
-            self.logger.warning(f"[{symbol}] not enough bars for a meaningful backtest")
+        features, labeled = self._prepare_backtest_frames(raw_bars, market_df, sector_df)
+        if len(features) < self.config.min_bars_required + 30:
+            self.logger.warning(f"[{symbol}] not enough continuous feature bars for a meaningful backtest")
             return None
 
         n_folds = max(1, self.config.backtest_walkforward_folds)
-        seed_end = int(len(dataset) * (1 - self.config.backtest_test_fraction))
-        oos_len = len(dataset) - seed_end
+        seed_end = int(len(features) * (1 - self.config.backtest_test_fraction))
+        oos_len = len(features) - seed_end
         fold_size = oos_len // n_folds
         # 30 bars (~1 trading day at 15-min bars) is a floor, not a target --
         # below it a fold is too thin to produce a meaningful trade sample
@@ -3421,7 +3779,6 @@ class Backtester:
             )
             return self.run_symbol(symbol, starting_equity, market_df=market_df, sector_df=sector_df)
 
-        embargo = self.config.label_horizon_bars()
         equity = starting_equity
         combined_equity_curve = [equity]
         combined_trades: List[Dict] = []
@@ -3429,20 +3786,19 @@ class Backtester:
 
         fold_start = seed_end
         for fold_idx in range(n_folds):
-            fold_end = len(dataset) if fold_idx == n_folds - 1 else fold_start + fold_size
-            test_df = dataset.iloc[fold_start:fold_end]
+            fold_end = len(features) if fold_idx == n_folds - 1 else fold_start + fold_size
+            test_df = features.iloc[fold_start:fold_end]
             if len(test_df) < 10:
                 break
 
-            train_end = max(0, fold_start - embargo)
-            train_df = dataset.iloc[:train_end]
+            train_df = self._training_rows_before(features, labeled, fold_start)
             if len(train_df) < self.config.min_bars_required:
                 fold_start = fold_end
                 continue
 
             model = MLSignalModel(f"{symbol}_backtest_wf", self.config, self.logger)
-            model.train(train_df)
-            if model.pipeline is None:
+            trained_ok = model.train(train_df)
+            if not trained_ok or model.pipeline is None:
                 self.logger.warning(
                     f"[{symbol}] fold {fold_idx + 1}/{n_folds}: model failed to train, skipping fold"
                 )
@@ -3811,8 +4167,45 @@ class Backtester:
 # 10. TRADING BOT ORCHESTRATOR
 # ==============================================================================
 
+@dataclass
+class PortfolioCycleState:
+    """One internally consistent account snapshot for a processing cycle.
+
+    Alpaca positions do not include accepted-but-unfilled entry orders. The
+    old loop therefore evaluated every symbol against the same opening
+    snapshot and could submit many entries in one pass despite max_positions
+    being five. Pending orders now reserve both a slot and estimated notional
+    until the next authoritative account refresh.
+    """
+
+    open_positions: Dict[str, object]
+    open_exposure: float
+    reserved_symbols: Set[str] = field(default_factory=set)
+    reserved_exposure_by_symbol: Dict[str, float] = field(default_factory=dict)
+    entries_allowed: bool = True
+
+    @property
+    def occupied_symbols(self) -> Set[str]:
+        return set(self.open_positions) | self.reserved_symbols
+
+    @property
+    def occupied_count(self) -> int:
+        return len(self.occupied_symbols)
+
+    @property
+    def total_exposure(self) -> float:
+        return self.open_exposure + sum(self.reserved_exposure_by_symbol.values())
+
+    def reserve_entry(self, symbol: str, notional: float) -> None:
+        self.reserved_symbols.add(symbol)
+        self.reserved_exposure_by_symbol[symbol] = max(
+            self.reserved_exposure_by_symbol.get(symbol, 0.0), max(0.0, notional)
+        )
+
+
 class TradingBot:
     def __init__(self, config: TradingConfig):
+        config.validate()
         self.config = config
         self.logger = build_logger(config.log_dir)
         self._safety_check()
@@ -3890,7 +4283,7 @@ class TradingBot:
         if extra:
             payload.update(extra)
         try:
-            self.heartbeat_path.write_text(json.dumps(payload, default=str))
+            write_json_atomic(self.heartbeat_path, payload)
         except Exception as exc:
             self.logger.debug(f"Failed to write heartbeat: {exc}")
 
@@ -4119,6 +4512,62 @@ class TradingBot:
                 continue
         return total
 
+    def _build_portfolio_cycle_state(
+        self, open_positions: Dict[str, object]
+    ) -> PortfolioCycleState:
+        """Combine filled positions with pending entries before sizing.
+
+        Open bracket children for symbols that already have a position are
+        protective orders, not new exposure, and are ignored here. For a
+        symbol without a filled position, an open order conservatively
+        reserves one slot. Its notional estimate uses the best available
+        order price; even when a market order has no price yet, the slot is
+        still reserved.
+        """
+        state = PortfolioCycleState(
+            open_positions=open_positions,
+            open_exposure=self._current_portfolio_exposure(open_positions),
+        )
+        open_orders = self.executor.get_open_orders()
+        if open_orders is None:
+            state.entries_allowed = False
+            self.logger.warning(
+                "Open-order state is unavailable; blocking new entries this cycle "
+                "while continuing to manage filled positions"
+            )
+            return state
+
+        for order in open_orders:
+            symbol = str(getattr(order, "symbol", "") or "").upper()
+            if not symbol or symbol in open_positions:
+                continue
+            try:
+                qty = abs(float(getattr(order, "qty", 0) or 0))
+            except (TypeError, ValueError):
+                qty = 0.0
+
+            price = 0.0
+            for attr in ("limit_price", "filled_avg_price", "stop_price"):
+                try:
+                    candidate = float(getattr(order, attr, 0) or 0)
+                except (TypeError, ValueError):
+                    candidate = 0.0
+                if candidate > 0:
+                    price = candidate
+                    break
+            # A market entry can be open without an exposed price. Its true
+            # notional is unknowable from this snapshot, so reserve infinite
+            # exposure (blocking additional entries) rather than silently
+            # counting it as $0 and weakening the portfolio cap.
+            estimated_notional = qty * price if price > 0 else float("inf")
+            state.reserve_entry(symbol, estimated_notional)
+
+        if state.reserved_symbols:
+            self.logger.info(
+                "Reserved pending entry slot(s): " + ", ".join(sorted(state.reserved_symbols))
+            )
+        return state
+
     # ------------------------------------------------------------- model
     def _train_symbol(self, symbol: str, raw_bars: pd.DataFrame) -> None:
         model = self.models[symbol]
@@ -4155,26 +4604,11 @@ class TradingBot:
         self,
         symbol: str,
         equity: float,
-        open_positions: Dict[str, object],
+        portfolio: PortfolioCycleState,
         minutes_to_close: Optional[float],
         raw_bars: pd.DataFrame,
-    ) -> Optional[EntryCandidate]:
-        """
-        Handles everything that is decided per-symbol in isolation:
-        managing an already-open position (model-flip exit, time-based
-        exit, trailing stop, scale-out) and evaluating whether this symbol
-        is a valid ENTRY candidate.
-
-        Position management still happens immediately and unconditionally
-        here -- exits must never wait on anything else in the cycle.
-
-        Entries do NOT happen here. If the symbol clears every per-symbol
-        gate, this returns an EntryCandidate for the caller to rank against
-        the rest of the universe; the portfolio-level gates and the actual
-        order submission live in _allocate_entries. Returns None when the
-        symbol is not a valid entry this cycle (including whenever it
-        already has a position, since that path is management, not entry).
-        """
+    ) -> None:
+        open_positions = portfolio.open_positions
         model = self.models[symbol]
         if model.pipeline is None:
             self.logger.info(f"[{symbol}] no trained model yet, skipping")
@@ -4269,15 +4703,34 @@ class TradingBot:
             self.trailing_stop_manager.update(symbol, position, signal.price, signal.atr)
             return None  # bracket order already manages stop/take on the resting order
 
+        # Accepted-but-unfilled entry orders occupy risk capacity just like a
+        # filled position. Do not submit another decision for that symbol or
+        # let the pending order disappear from the portfolio limits.
+        if symbol in portfolio.reserved_symbols:
+            self.logger.info(f"[{symbol}] entry already pending, skipping new signal")
+            return
+
+        if not portfolio.entries_allowed:
+            return
+
         # --- No new entries if we're too close to the close ---
         if minutes_to_close is not None and minutes_to_close <= self.config.entry_cutoff_minutes_before_close:
-            return None
+            return
+
+        # --- No new entries beyond max_positions ---
+        if portfolio.occupied_count >= self.config.max_positions:
+            return
 
         if not self._model_has_edge(symbol, model):
             return None
 
         if signal.action == "FLAT":
-            return None
+            return
+
+        if self.risk_manager.correlation_limit_reached(
+            symbol, list(portfolio.occupied_symbols)
+        ):
+            return
 
         # Everything above is decided per-symbol, so it's settled here. The
         # portfolio-level gates (max_positions, correlation caps, exposure
@@ -4294,54 +4747,9 @@ class TradingBot:
             symbol_multiplier=symbol_multiplier,
         )
 
-    def _entry_score(self, signal: Signal, symbol_multiplier: float) -> float:
-        """Thin wrapper over the shared entry_score() so the live path and
-        the portfolio backtest can never drift apart. See that function."""
-        return entry_score(
-            signal.confidence, symbol_multiplier, self.config.entry_ranking_enabled
-        )
-
-    def _allocate_entries(
-        self,
-        candidates: List[EntryCandidate],
-        equity: float,
-        open_positions: Dict[str, object],
-    ) -> int:
-        """
-        Spends the cycle's remaining position slots on the best available
-        candidates, applying every PORTFOLIO-level risk gate against a book
-        that updates as each entry is taken.
-
-        That last part is the whole point. These gates were previously
-        evaluated inside the per-symbol pass against `open_positions`, which
-        is a snapshot taken ONCE at the top of the cycle and never updated
-        as orders go out. Nothing incremented it when an entry was
-        submitted, so every symbol in the cycle was measured against the
-        same stale book: with 12 simultaneous signals and max_positions=5,
-        all 12 passed `len(open_positions) >= max_positions` and all 12 were
-        submitted. The correlation cap and the total-exposure budget were
-        bypassed the same way, since they read from that same snapshot.
-
-        Re-fetching positions from the broker mid-loop would NOT have fixed
-        it: a submitted bracket order only becomes a position once it
-        fills, so the fresh read would still show the account as flat for
-        as long as the fills take. The fix has to be local accounting --
-        an entry counts against the book the moment it is submitted, not
-        when the broker gets around to confirming it.
-
-        Returns the number of entries actually submitted.
-        """
-        slots_remaining = self.config.max_positions - len(open_positions)
-        if slots_remaining <= 0:
-            return 0
-        if not candidates:
-            return 0
-
-        # Highest score first, symbol as a tiebreak so a tie resolves
-        # deterministically instead of by dict/list ordering.
-        ranked = sorted(candidates, key=lambda c: (-c.score, c.symbol))
-
-        if self.config.entry_ranking_enabled and len(ranked) > slots_remaining:
+        current_exposure = portfolio.total_exposure
+        qty = self.risk_manager.exposure_capped_qty(qty, signal.price, equity, current_exposure)
+        if qty <= 0:
             self.logger.info(
                 f"{len(ranked)} entry candidates for {slots_remaining} open slot(s) -- "
                 "taking highest expected-value first: "
@@ -4363,45 +4771,10 @@ class TradingBot:
                 )
                 break
 
-            symbol, signal = candidate.symbol, candidate.signal
+        if self._submit_entry(symbol, signal, qty):
+            portfolio.reserve_entry(symbol, qty * signal.price)
 
-            if self.risk_manager.correlation_limit_reached(symbol, held_symbols):
-                continue
-
-            qty = self.risk_manager.position_size(
-                equity,
-                signal.price,
-                signal.atr,
-                performance_multiplier=performance_multiplier,
-                confidence_multiplier=candidate.confidence_multiplier,
-                symbol_multiplier=candidate.symbol_multiplier,
-            )
-            if qty <= 0:
-                continue
-
-            qty = self.risk_manager.exposure_capped_qty(qty, signal.price, equity, exposure)
-            if qty <= 0:
-                self.logger.info(
-                    f"[{symbol}] skip entry: no remaining portfolio exposure budget "
-                    f"(current=${exposure:,.0f}, cap={self.config.max_total_exposure_pct:.0%} of equity)"
-                )
-                continue
-
-            if self.executor.has_open_orders(symbol):
-                self.logger.info(f"[{symbol}] already has open orders, skipping new entry")
-                continue
-
-            self._submit_entry(symbol, signal, qty)
-
-            # Count it against the book NOW -- see the docstring above.
-            held_symbols.append(symbol)
-            exposure += qty * signal.price
-            slots_remaining -= 1
-            entries_submitted += 1
-
-        return entries_submitted
-
-    def _submit_entry(self, symbol: str, signal: Signal, qty: int) -> None:
+    def _submit_entry(self, symbol: str, signal: Signal, qty: int) -> bool:
         """
         Submits the entry order for a new position -- ALWAYS as exactly one
         bracket order for the full quantity, at the full stop-loss and
@@ -4428,21 +4801,24 @@ class TradingBot:
         if order is not None or self.config.dry_run:
             order_id = str(order.id) if order is not None else ""
             self.journal.log_trade(signal, qty, stop_price, full_take_price, order_id=order_id)
-            self._position_opened_at[symbol] = datetime.now(timezone.utc)
-
-        if self.config.enable_partial_scale_out and qty >= 2:
-            _, near_take_price = self.risk_manager.stop_take_levels(
-                signal.price, signal.atr, signal.action,
-                take_mult=self.config.scale_out_first_target_atr_mult,
-            )
-            self.scale_out_manager.register(
-                symbol=symbol,
-                side=signal.action,
-                total_qty=qty,
-                stop_price=stop_price,
-                near_take_price=near_take_price,
-                full_take_price=full_take_price,
-            )
+            if self.config.enable_partial_scale_out and qty >= 2:
+                _, near_take_price = self.risk_manager.stop_take_levels(
+                    signal.price, signal.atr, signal.action,
+                    take_mult=self.config.scale_out_first_target_atr_mult,
+                )
+                self.scale_out_manager.register(
+                    symbol=symbol,
+                    side=signal.action,
+                    total_qty=qty,
+                    stop_price=stop_price,
+                    near_take_price=near_take_price,
+                    full_take_price=full_take_price,
+                )
+            # Start the hold timer only once Alpaca reports a filled position
+            # on a later account refresh, not when a limit order is merely
+            # accepted and may remain pending for some time.
+            return True
+        return False
 
     def _flatten_for_close(self) -> None:
         self.logger.info("Approaching market close: flattening all positions.")
@@ -4509,6 +4885,7 @@ class TradingBot:
 
                 minutes_to_close = self.data_feed.minutes_to_close()
                 open_positions = self.executor.get_open_positions()
+                portfolio = self._build_portfolio_cycle_state(open_positions)
 
                 # A position may have closed on its own (stop/take fill) since
                 # the last cycle -- clear its trailing-stop and scale-out
@@ -4518,7 +4895,7 @@ class TradingBot:
                     if tracked_symbol not in open_positions:
                         self.trailing_stop_manager.reset(tracked_symbol)
                 for tracked_symbol in self.scale_out_manager.tracked_symbols():
-                    if tracked_symbol not in open_positions:
+                    if tracked_symbol not in portfolio.occupied_symbols:
                         self.scale_out_manager.reset(tracked_symbol)
                 for tracked_symbol in list(self._position_opened_at.keys()):
                     if tracked_symbol not in open_positions:
@@ -4542,8 +4919,8 @@ class TradingBot:
                 candidates: List[EntryCandidate] = []
                 for symbol in self.config.symbols:
                     try:
-                        candidate = self._process_symbol(
-                            symbol, equity, open_positions, minutes_to_close,
+                        self._process_symbol(
+                            symbol, equity, portfolio, minutes_to_close,
                             prefetched_bars.get(symbol, pd.DataFrame()),
                         )
                         if candidate is not None:
@@ -4567,7 +4944,13 @@ class TradingBot:
                 self.fill_tracker.poll_and_record()
                 self._write_heartbeat(
                     "running",
-                    {"equity": equity, "cash": cash, "open_positions": len(open_positions)},
+                    {
+                        "equity": equity,
+                        "cash": cash,
+                        "open_positions": len(open_positions),
+                        "pending_entries": len(portfolio.reserved_symbols),
+                        "occupied_slots": portfolio.occupied_count,
+                    },
                 )
 
                 time.sleep(self.config.poll_interval_seconds)
@@ -4650,6 +5033,14 @@ def parse_args() -> argparse.Namespace:
             "and exit. Reads local model cache files only -- no API calls needed."
         ),
     )
+    parser.add_argument(
+        "--validate-config",
+        action="store_true",
+        help=(
+            "Validate defaults, JSON overrides, and CLI overrides, print a short "
+            "safety summary, and exit without credentials or API calls."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -4698,6 +5089,9 @@ def build_config_from_args(args: argparse.Namespace) -> TradingConfig:
 
     if args.dry_run:
         config.dry_run = True
+
+    if isinstance(config.symbols, list):
+        config.symbols = [str(symbol).strip().upper() for symbol in config.symbols]
 
     return config
 
@@ -4785,6 +5179,20 @@ def print_model_status(config: TradingConfig, logger: logging.Logger) -> None:
 def main() -> None:
     args = parse_args()
     config = build_config_from_args(args)
+
+    try:
+        config.validate()
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(str(exc))
+
+    if args.validate_config:
+        print("Configuration valid.")
+        print(
+            f"Paper-only | {len(config.symbols)} symbols | max {config.max_positions} positions | "
+            f"risk {config.risk_per_trade_pct:.2%}/trade | "
+            f"portfolio exposure cap {config.max_total_exposure_pct:.0%}"
+        )
+        return
 
     if args.dump_config:
         Path(args.dump_config).write_text(json.dumps(asdict(config), indent=2, default=str))
