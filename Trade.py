@@ -4747,19 +4747,56 @@ class TradingBot:
             symbol_multiplier=symbol_multiplier,
         )
 
-        current_exposure = portfolio.total_exposure
-        qty = self.risk_manager.exposure_capped_qty(qty, signal.price, equity, current_exposure)
-        if qty <= 0:
+    def _entry_score(self, signal: Signal, symbol_multiplier: float) -> float:
+        """Thin wrapper over the shared entry_score() so the live path and
+        the portfolio backtest can never drift apart. See that function."""
+        return entry_score(
+            signal.confidence, symbol_multiplier, self.config.entry_ranking_enabled
+        )
+
+    def _allocate_entries(
+        self,
+        candidates: List[EntryCandidate],
+        equity: float,
+        portfolio: "PortfolioCycleState",
+    ) -> int:
+        """
+        Spends the cycle's remaining position slots on the best available
+        candidates, applying every PORTFOLIO-level risk gate against a book
+        that updates as each entry is taken.
+
+        Slot accounting lives in PortfolioCycleState, which counts an
+        accepted-but-unfilled order against both the slot count and the
+        exposure budget -- Alpaca does not report a position until the
+        order fills, so without that reservation a cycle could submit far
+        more entries than max_positions allows.
+
+        Ranking is why this is a separate phase. With ~7 valid candidates
+        per free slot, filling slots in config-list order means taking the
+        first five signals walked past, an ordering unrelated to signal
+        quality. Deferring submission until every candidate is known lets
+        the slots go to the highest expected value instead.
+
+        Returns the number of entries actually submitted.
+        """
+        if not candidates or not portfolio.entries_allowed:
+            return 0
+
+        slots_remaining = self.config.max_positions - portfolio.occupied_count
+        if slots_remaining <= 0:
+            return 0
+
+        # Highest score first, symbol as a tiebreak so a tie resolves
+        # deterministically rather than by list ordering.
+        ranked = sorted(candidates, key=lambda c: (-c.score, c.symbol))
+
+        if self.config.entry_ranking_enabled and len(ranked) > slots_remaining:
             self.logger.info(
                 f"{len(ranked)} entry candidates for {slots_remaining} open slot(s) -- "
                 "taking highest expected-value first: "
                 + ", ".join(f"{c.symbol}({c.score:.3f})" for c in ranked[:slots_remaining + 3])
             )
 
-        # Local, mutable view of the book. Seeded from the broker's real
-        # positions, then updated as this cycle's entries are submitted.
-        held_symbols = list(open_positions.keys())
-        exposure = self._current_portfolio_exposure(open_positions)
         performance_multiplier = self._get_performance_multiplier()
         entries_submitted = 0
 
@@ -4771,8 +4808,51 @@ class TradingBot:
                 )
                 break
 
-        if self._submit_entry(symbol, signal, qty):
-            portfolio.reserve_entry(symbol, qty * signal.price)
+            symbol, signal = candidate.symbol, candidate.signal
+
+            # Re-checked here rather than trusted from phase 1: entries
+            # taken earlier in THIS loop change both of these.
+            if symbol in portfolio.reserved_symbols:
+                continue
+            if self.risk_manager.correlation_limit_reached(
+                symbol, list(portfolio.occupied_symbols)
+            ):
+                continue
+
+            qty = self.risk_manager.position_size(
+                equity,
+                signal.price,
+                signal.atr,
+                performance_multiplier=performance_multiplier,
+                confidence_multiplier=candidate.confidence_multiplier,
+                symbol_multiplier=candidate.symbol_multiplier,
+            )
+            if qty <= 0:
+                continue
+
+            qty = self.risk_manager.exposure_capped_qty(
+                qty, signal.price, equity, portfolio.total_exposure
+            )
+            if qty <= 0:
+                self.logger.info(
+                    f"[{symbol}] skip entry: no remaining portfolio exposure budget "
+                    f"(current=${portfolio.total_exposure:,.0f}, "
+                    f"cap={self.config.max_total_exposure_pct:.0%} of equity)"
+                )
+                continue
+
+            if self.executor.has_open_orders(symbol):
+                self.logger.info(f"[{symbol}] already has open orders, skipping new entry")
+                continue
+
+            if self._submit_entry(symbol, signal, qty):
+                # Reserve the slot and its notional immediately -- see the
+                # docstring; the fill may be seconds away or never.
+                portfolio.reserve_entry(symbol, qty * signal.price)
+                slots_remaining -= 1
+                entries_submitted += 1
+
+        return entries_submitted
 
     def _submit_entry(self, symbol: str, signal: Signal, qty: int) -> bool:
         """
@@ -4919,7 +4999,7 @@ class TradingBot:
                 candidates: List[EntryCandidate] = []
                 for symbol in self.config.symbols:
                     try:
-                        self._process_symbol(
+                        candidate = self._process_symbol(
                             symbol, equity, portfolio, minutes_to_close,
                             prefetched_bars.get(symbol, pd.DataFrame()),
                         )
@@ -4935,7 +5015,7 @@ class TradingBot:
                 # updates as entries go out. Ranking only matters because
                 # this is deferred until every candidate is known.
                 try:
-                    self._allocate_entries(candidates, equity, open_positions)
+                    self._allocate_entries(candidates, equity, portfolio)
                 except Exception as exc:
                     self.logger.error(f"error while allocating entries: {exc}")
                     self.logger.debug(traceback.format_exc())
