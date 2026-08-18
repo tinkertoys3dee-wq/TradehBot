@@ -266,5 +266,229 @@ class OrderProtectionTests(TempConfigMixin, unittest.TestCase):
         self.assertEqual(calls[1][:4], ("oco", "TEST", 5, "BUY"))
 
 
+class EntryAllocationTests(unittest.TestCase):
+    """
+    Guards the live entry path end to end.
+
+    A merge once left the run loop calling _process_symbol without binding
+    its result, calling a deleted _allocate_entries, and calling a deleted
+    _entry_score. All three raised inside try/except blocks that log and
+    continue, so the bot ran, logged, and silently submitted ZERO entries.
+    Nothing in the suite noticed, because nothing asserted that a valid
+    signal actually produces an order. These tests do.
+    """
+
+    def setUp(self):
+        self.logger = quiet_logger()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _bot(self, **overrides):
+        from Trade import EntryCandidate, RiskManager  # noqa: F401
+
+        params = dict(
+            symbols=["AAA", "BBB", "CCC"],
+            model_dir=self.tmp.name, log_dir=self.tmp.name, state_dir=self.tmp.name,
+            max_positions=5, dry_run=True, correlation_groups={},
+            max_total_exposure_pct=1.0,
+            adaptive_sizing_enabled=False, symbol_adaptive_sizing_enabled=False,
+            confidence_sizing_enabled=False,
+        )
+        params.update(overrides)
+        config = TradingConfig(**params)
+        config.validate()
+
+        submitted = []
+
+        class FakeExecutor:
+            def has_open_orders(self, symbol):
+                return False
+
+            def submit_bracket_order(self, symbol, qty, side, stop, take, reference_price=None):
+                submitted.append((symbol, qty))
+                return SimpleNamespace(id="entry-1")
+
+        bot = TradingBot.__new__(TradingBot)
+        bot.config = config
+        bot.logger = self.logger
+        bot.executor = FakeExecutor()
+        bot.journal = SimpleNamespace(log_trade=lambda *a, **k: None)
+        bot.scale_out_manager = SimpleNamespace(register=lambda **k: None)
+        bot._position_opened_at = {}
+        bot.risk_manager = RiskManager(config, self.logger)
+        bot._get_performance_multiplier = lambda: 1.0
+        bot.submitted = submitted
+        return bot
+
+    def _candidates(self, bot, specs):
+        from Trade import EntryCandidate
+
+        out = []
+        for symbol, confidence, multiplier in specs:
+            signal = Signal(symbol, "BUY", confidence, 100.0, 1.0, "test")
+            out.append(EntryCandidate(
+                symbol=symbol, signal=signal,
+                score=bot._entry_score(signal, multiplier),
+                confidence_multiplier=1.0, symbol_multiplier=multiplier,
+            ))
+        return out
+
+    def test_valid_candidates_actually_submit_orders(self):
+        """The regression that mattered: entries must reach the broker."""
+        bot = self._bot()
+        portfolio = PortfolioCycleState(open_positions={}, open_exposure=0.0)
+        specs = [("AAA", 0.70, 1.0), ("BBB", 0.68, 1.0)]
+        submitted = bot._allocate_entries(self._candidates(bot, specs), 100_000.0, portfolio)
+        self.assertEqual(submitted, 2)
+        self.assertEqual(len(bot.submitted), 2)
+
+    def test_max_positions_enforced_within_one_cycle(self):
+        bot = self._bot(max_positions=2)
+        portfolio = PortfolioCycleState(open_positions={}, open_exposure=0.0)
+        specs = [(s, 0.70, 1.0) for s in ["AAA", "BBB", "CCC", "DDD", "EEE"]]
+        bot._allocate_entries(self._candidates(bot, specs), 100_000.0, portfolio)
+        self.assertEqual(len(bot.submitted), 2)
+        self.assertEqual(portfolio.occupied_count, 2)
+
+    def test_pending_entries_reserve_slots(self):
+        """An accepted-but-unfilled order still occupies a slot."""
+        bot = self._bot(max_positions=3)
+        portfolio = PortfolioCycleState(open_positions={}, open_exposure=0.0)
+        bot._allocate_entries(self._candidates(bot, [("AAA", 0.70, 1.0)]), 100_000.0, portfolio)
+        self.assertIn("AAA", portfolio.reserved_symbols)
+        self.assertEqual(portfolio.occupied_count, 1)
+
+    def test_entries_ranked_by_expected_value(self):
+        bot = self._bot(max_positions=2, entry_ranking_enabled=True)
+        portfolio = PortfolioCycleState(open_positions={}, open_exposure=0.0)
+        specs = [("LOW", 0.55, 1.0), ("BEST", 0.90, 1.5), ("GOOD", 0.80, 1.0)]
+        bot._allocate_entries(self._candidates(bot, specs), 100_000.0, portfolio)
+        self.assertEqual([s for s, _ in bot.submitted], ["BEST", "GOOD"])
+
+    def test_correlation_cap_applies_within_one_cycle(self):
+        bot = self._bot(max_positions=5,
+                        correlation_groups={"grp": ["AAA", "BBB", "CCC"]},
+                        max_positions_per_correlation_group=2)
+        portfolio = PortfolioCycleState(open_positions={}, open_exposure=0.0)
+        specs = [(s, 0.70, 1.0) for s in ["AAA", "BBB", "CCC"]]
+        bot._allocate_entries(self._candidates(bot, specs), 100_000.0, portfolio)
+        self.assertEqual(len(bot.submitted), 2)
+
+    def test_no_entries_when_entries_disallowed(self):
+        bot = self._bot()
+        portfolio = PortfolioCycleState(
+            open_positions={}, open_exposure=0.0, entries_allowed=False
+        )
+        submitted = bot._allocate_entries(
+            self._candidates(bot, [("AAA", 0.70, 1.0)]), 100_000.0, portfolio
+        )
+        self.assertEqual(submitted, 0)
+        self.assertEqual(bot.submitted, [])
+
+
+class TrailingStopGeometryTests(unittest.TestCase):
+    """
+    The trailing stop previously engaged on entry and trailed at
+    stop_loss_atr_mult, so a normal retrace stopped winners out before the
+    take-profit could pay. Live fills showed average win $29.84 against
+    average loss $30.34 -- ~1:1 against a configured 1.5:1.
+    """
+
+    def setUp(self):
+        self.logger = quiet_logger()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.config = TradingConfig(
+            model_dir=self.tmp.name, log_dir=self.tmp.name, state_dir=self.tmp.name,
+            trailing_stop_activation_atr_mult=1.5,
+            trailing_stop_distance_atr_mult=1.5,
+        )
+
+    def _manager(self):
+        from Trade import TrailingStopManager
+
+        replaced = []
+
+        class FakeExecutor:
+            def get_open_stop_legs(self, symbol):
+                return [SimpleNamespace(id="stop-1")]
+
+            def replace_stop_order(self, order_id, price):
+                replaced.append(price)
+                return True
+
+        return TrailingStopManager(self.config, FakeExecutor(), self.logger), replaced
+
+    def test_does_not_trail_before_activation(self):
+        manager, replaced = self._manager()
+        position = SimpleNamespace(qty=10, avg_entry_price=100.0)
+        manager.update("TEST", position, 100.5, 1.0)   # +0.5 ATR, under +1.5
+        self.assertEqual(replaced, [])
+
+    def test_trails_once_sufficiently_profitable(self):
+        manager, replaced = self._manager()
+        position = SimpleNamespace(qty=10, avg_entry_price=100.0)
+        manager.update("TEST", position, 102.0, 1.0)   # +2.0 ATR
+        self.assertEqual(replaced, [100.5])            # 102.0 - 1.5
+
+    def test_never_loosens_an_existing_stop(self):
+        manager, replaced = self._manager()
+        position = SimpleNamespace(qty=10, avg_entry_price=100.0)
+        manager.update("TEST", position, 102.0, 1.0)
+        manager.update("TEST", position, 101.0, 1.0)
+        self.assertEqual(replaced, [100.5])
+
+    def test_backtest_models_the_same_geometry(self):
+        """Backtest and live must trail identically or the backtest is
+        measuring a strategy that does not trade."""
+        backtester = Backtester(
+            self.config, None,
+            FeatureEngineer(atr_percentile_window=self.config.atr_percentile_window),
+            self.logger,
+        )
+        position = {"side": "BUY", "entry_price": 100.0, "stop": 98.0, "take": 103.0}
+        self.assertEqual(backtester._trailing_stop_for(position, 100.5, 99.8, 1.0), 98.0)
+        self.assertAlmostEqual(backtester._trailing_stop_for(position, 102.0, 101.0, 1.0), 100.5)
+        self.assertAlmostEqual(backtester._trailing_stop_for(position, 101.0, 100.0, 1.0), 100.5)
+
+
+class NoMissingSelfMethodsTest(unittest.TestCase):
+    """
+    Static guard against the exact defect that caused the outage: calling
+    self.something() where `something` is not defined on the class. Python
+    only raises that at runtime, and the run loop swallows it.
+    """
+
+    def test_every_self_call_resolves(self):
+        import ast
+
+        source = Path(__file__).resolve().parents[1] / "Trade.py"
+        tree = ast.parse(source.read_text())
+        problems = []
+        for cls in [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]:
+            defined = {
+                n.name for n in cls.body
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+            assigned = set()
+            for node in ast.walk(cls):
+                if (isinstance(node, ast.Attribute)
+                        and isinstance(node.value, ast.Name)
+                        and node.value.id == "self"
+                        and isinstance(node.ctx, ast.Store)):
+                    assigned.add(node.attr)
+                if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                    assigned.add(node.target.id)
+            for node in ast.walk(cls):
+                if (isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and isinstance(node.func.value, ast.Name)
+                        and node.func.value.id == "self"):
+                    name = node.func.attr
+                    if name not in defined and name not in assigned and not name.startswith("__"):
+                        problems.append(f"{cls.name}.{name}")
+        self.assertEqual(problems, [], f"self.X() calls with no definition: {problems}")
+
+
 if __name__ == "__main__":
     unittest.main()

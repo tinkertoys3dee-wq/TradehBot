@@ -4607,7 +4607,23 @@ class TradingBot:
         portfolio: PortfolioCycleState,
         minutes_to_close: Optional[float],
         raw_bars: pd.DataFrame,
-    ) -> None:
+    ) -> Optional[EntryCandidate]:
+        """
+        Handles everything decided per-symbol in isolation: managing an
+        already-open position (model-flip exit, time-based exit, trailing
+        stop, scale-out) and evaluating whether this symbol is a valid
+        ENTRY candidate.
+
+        Position management happens immediately and unconditionally here --
+        exits must never wait on anything else in the cycle.
+
+        Entries do NOT happen here. If the symbol clears every per-symbol
+        gate, this returns an EntryCandidate for the caller to rank against
+        the rest of the universe; the portfolio-level gates and the actual
+        order submission live in _allocate_entries. Returns None when the
+        symbol is not a valid entry this cycle (including whenever it
+        already has a position, since that path is management, not entry).
+        """
         open_positions = portfolio.open_positions
         model = self.models[symbol]
         if model.pipeline is None:
